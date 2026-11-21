@@ -6,8 +6,8 @@
 //! Handles all 5 Windows disk serial query vectors:
 //! 1. `IOCTL_STORAGE_QUERY_PROPERTY` (`0x002D1400`):
 //!    - `StorageDeviceProperty (0)` -> `STORAGE_DEVICE_DESCRIPTOR`
-//!    - `StorageDeviceUniqueIdProperty (3)` -> only the embedded device descriptor serial
-//!    - `StorageDeviceIdProperty (2)` -> passed through (VPD 0x83 identifiers)
+//!    - `StorageDeviceUniqueIdProperty (3)` -> embedded serial, optionally exact-matched ID
+//!    - `StorageDeviceIdProperty (2)` -> optional exact-matched SCSI name-string alias
 //!    - `StorageAdapterProtocolSpecificProperty (49)` / `StorageDeviceProtocolSpecificProperty (50)`
 //!      -> `STORAGE_PROTOCOL_DATA_DESCRIPTOR` (NVMe 4096-byte Identify Controller & ATA 512-byte Identify)
 //!    - `StorageAdapterSerialNumberProperty (56)` -> `STORAGE_ADAPTER_SERIAL_NUMBER` (UTF-16LE)
@@ -21,6 +21,8 @@ use core::mem::{offset_of, size_of};
 #[path = "scsi_pass_through.rs"]
 mod scsi_pass_through;
 use scsi_pass_through::ScsiPassThrough;
+#[path = "namespace_id_patch.rs"]
+mod namespace_id_patch;
 
 const SCSI_HEADER_SIZE: usize = size_of::<ScsiPassThrough>();
 const SCSI_TRANSFER_LENGTH: usize = offset_of!(ScsiPassThrough, transfer_length);
@@ -76,6 +78,7 @@ pub const TAG_SMART_RCV_DRIVE_DATA: u8 = 6;
 pub const TAG_ATA_PASS_THROUGH: u8 = 7;
 pub const TAG_SCSI_PASS_THROUGH: u8 = 8;
 pub const TAG_STORAGE_DEVICE_UNIQUE_ID: u8 = 9;
+pub const TAG_STORAGE_DEVICE_ID: u8 = 10;
 
 /// Inspects an incoming `IRP_MJ_DEVICE_CONTROL` request (`io_control_code` and `system_buffer`)
 /// BEFORE the lower driver overwrites `SystemBuffer`, and returns the completion tag (`TAG_*`)
@@ -95,7 +98,7 @@ pub fn classify_ioctl_request(io_control_code: u32, input_buf: &[u8]) -> u8 {
             }
             match property_id {
                 STORAGE_DEVICE_PROPERTY => TAG_STORAGE_DEVICE_DESCRIPTOR,
-                STORAGE_DEVICE_ID_PROPERTY => TAG_NONE, // VPD 0x83 contains device identifiers.
+                STORAGE_DEVICE_ID_PROPERTY => TAG_STORAGE_DEVICE_ID, // Read-only unless opt-in namespace patch is used.
                 STORAGE_DEVICE_UNIQUE_ID_PROPERTY => TAG_STORAGE_DEVICE_UNIQUE_ID,
                 STORAGE_ADAPTER_PROTOCOL_SPECIFIC_PROPERTY
                 | STORAGE_DEVICE_PROTOCOL_SPECIFIC_PROPERTY
@@ -129,6 +132,26 @@ pub fn patch_ioctl_output_by_tag(tag: u8, buf: &mut [u8], new_serial: &[u8; 20])
         TAG_ATA_PASS_THROUGH => patch_ata_pass_through(buf, new_serial),
         TAG_SCSI_PASS_THROUGH => patch_scsi_pass_through(buf, new_serial),
         _ => false,
+    }
+}
+
+/// Opt-in second pass for the exact observed Micron SCSI name string.
+/// The serial-only path remains the default when the driver feature is off.
+pub fn patch_ioctl_output_with_namespace_id(
+    tag: u8,
+    buf: &mut [u8],
+    new_serial: &[u8; 20],
+) -> bool {
+    match tag {
+        TAG_STORAGE_DEVICE_ID => namespace_id_patch::rewrite_device_id(buf, new_serial),
+        TAG_STORAGE_DEVICE_UNIQUE_ID => {
+            // Keep the already working embedded serial rewrite and additionally
+            // update the independent identifier descriptor, if it exactly matches.
+            let serial = patch_storage_device_unique_id(buf, new_serial);
+            let id = namespace_id_patch::rewrite_duid_id(buf, new_serial);
+            serial || id
+        }
+        _ => patch_ioctl_output_by_tag(tag, buf, new_serial),
     }
 }
 
