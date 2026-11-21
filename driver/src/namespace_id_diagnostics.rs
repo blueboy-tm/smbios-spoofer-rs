@@ -21,9 +21,8 @@ pub struct PropertyCounters {
 }
 impl PropertyCounters {
     pub const fn empty() -> Self {
-        const Z: AtomicU64 = AtomicU64::new(0);
         Self {
-            requests: Z, completions: AtomicU64::new(0),
+            requests: AtomicU64::new(0), completions: AtomicU64::new(0),
             successful: AtomicU64::new(0), failed: AtomicU64::new(0),
             invalid_output: AtomicU64::new(0), patch_attempts: AtomicU64::new(0),
             patched: AtomicU64::new(0), rejected: AtomicU64::new(0),
