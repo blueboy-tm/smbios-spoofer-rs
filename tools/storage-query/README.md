@@ -157,3 +157,67 @@ After profile regeneration with R, the operator observed the previous UUID in Ma
 ```
 
 Both current values establish a snapshot only. Determining writer order requires corresponding historical evidence. This issue is independent of the storage-provider investigation.
+
+### Opt-in boot attachment snapshot
+
+The driver feature `attachment-diagnostics` retains 13 one-time results in a
+208-byte fixed array in the loaded driver image. DriverEntry is the only writer.
+Each row records the interrupt time just after the helper returned, then
+publishes the outcome with a release store. There are no diagnostic callbacks,
+request counters, serials, pointers, file writes or writes from completion.
+The default driver has no snapshot export or diagnostic clock call.
+
+For a separately authorized hardware verification, the affected boot must
+already use the feature build. Use an existing kernel debugger session or a
+kernel dump from that boot that contains the loaded driver's data pages.
+A user-mode debugger, a normal build, or a dump captured after unload cannot
+supply the snapshot. No debugger setup or boot setting changes are part of
+this procedure. In WinDbg, run:
+
+```text
+x *!SmbiosAttachmentSnapshot
+dq <address returned by x> L1a
+```
+
+Read the 26 hexadecimal quadwords as 13 consecutive pairs. In order, rows
+0–7 represent the named HarddiskN/DRN attempts, 8–11 represent RaidPort0–3,
+and 12 represents Spaceport. The first word is interrupt time in 100 ns units
+since boot (divide by 10,000,000 for seconds). The high 32 bits of the second
+word encode the stage below. The low 32 bits preserve the call's NTSTATUS;
+WinDbg `!error <hex status>` can decode it. A zero status at a failed stage
+can indicate a missing output pointer.
+
+| Stage | What the helper observed |
+| --- | --- |
+| 0 | No published result for this load at capture time. |
+| 1 | Attachment table full before lookup; no DDI status. |
+| 2 | Named-device lookup failed or returned a null target. |
+| 3 | Filter-device creation failed or returned a null device. |
+| 4 | Stack attachment failed or produced no lower device. |
+| 5 | Stack attachment succeeded and the filter was recorded in the attachment table. |
+
+On the already-confirmed split, collect the snapshot once. A name-not-found
+result followed by a device-arrival record for that same target supports late
+availability. Compare timestamps only after aligning the trace to the same
+boot clock. A successful row rules out a missed attachment *for that named
+attempt*. It establishes neither the provider's request target nor when the
+provider acquired its serial. Even all-success rows leave earlier enumeration,
+reuse and a different acquisition path open. Use the provider evidence criteria
+above before selecting a correction. Repeating the reload would erase this
+load's snapshot and change the condition under investigation.
+
+The existing unload path marks unloading, detaches recorded devices, spins
+for a bounded interval for counted completions and then deletes filter devices.
+That timeout does not guarantee all I/O has drained. The snapshot adds no
+outstanding work or references. Any future arrival subscription would need
+independent callback rundown, removal handling and duplicate-attachment
+protection. The reported values alone do not justify that lifecycle change.
+
+Offline snapshot-format regression test from the repository root:
+
+```sh
+rustc --edition 2024 --test driver/src/attachment.rs -o attachment-tests
+./attachment-tests
+```
+
+[Windows interrupt time contract](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-kequeryinterrupttimeprecise)

@@ -27,6 +27,24 @@
 #![no_main]
 #![allow(non_snake_case, non_camel_case_types, dead_code)]
 
+mod attachment;
+use attachment::Outcome;
+
+#[cfg(feature = "attachment-diagnostics")]
+#[unsafe(no_mangle)]
+static SmbiosAttachmentSnapshot: [attachment::Record; 13] =
+    [const { attachment::Record::empty() }; 13];
+
+#[cfg(feature = "attachment-diagnostics")]
+fn record_attachment(index: usize, outcome: Outcome) {
+    unsafe extern "system" {
+        fn KeQueryInterruptTimePrecise(qpc: *mut u64) -> u64;
+    }
+    let mut qpc = 0;
+    let time = unsafe { KeQueryInterruptTimePrecise(&mut qpc) };
+    SmbiosAttachmentSnapshot[index].publish(time, outcome);
+}
+
 use core::ffi::c_void;
 use core::panic::PanicInfo;
 use core::ptr;
@@ -1040,10 +1058,10 @@ unsafe fn attach_single_device_path(
     driver_object: *mut DRIVER_OBJECT,
     ustr: &UNICODE_STRING,
     disk_index: u32,
-) -> bool {
+) -> Outcome {
     let slot = ATTACHED_COUNT.load(Ordering::Relaxed);
     if slot >= MAX_ATTACHED_FIDOS {
-        return false;
+        return Outcome::Capacity;
     }
 
     let mut file_object: *mut c_void = ptr::null_mut();
@@ -1058,7 +1076,7 @@ unsafe fn attach_single_device_path(
         )
     };
     if status < 0 || target_device.is_null() {
-        return false;
+        return Outcome::Lookup(status);
     }
 
     let mut filter_device: *mut DEVICE_OBJECT = ptr::null_mut();
@@ -1074,7 +1092,7 @@ unsafe fn attach_single_device_path(
         )
     };
 
-    let mut attached = false;
+    let mut outcome = Outcome::Create(create_status);
     if create_status >= 0 && !filter_device.is_null() {
         unsafe {
             let ext = (*filter_device).DeviceExtension as *mut FilterExtension;
@@ -1094,8 +1112,9 @@ unsafe fn attach_single_device_path(
                 (*filter_device).Flags &= !DO_DEVICE_INITIALIZING;
                 ATTACHED_FIDOS[slot] = filter_device;
                 ATTACHED_COUNT.store(slot + 1, Ordering::Release);
-                attached = true;
+                outcome = Outcome::Attached(attach_status);
             } else {
+                outcome = Outcome::Attach(attach_status);
                 IoDeleteDevice(filter_device);
             }
         }
@@ -1106,7 +1125,7 @@ unsafe fn attach_single_device_path(
             ObfDereferenceObject(file_object);
         }
     }
-    attached
+    outcome
 }
 
 unsafe fn attach_all_storage_targets(driver_object: *mut DRIVER_OBJECT) {
@@ -1131,7 +1150,9 @@ unsafe fn attach_all_storage_targets(driver_object: *mut DRIVER_OBJECT) {
             Buffer: hd_path.as_ptr(),
         };
         unsafe {
-            let _ = attach_single_device_path(driver_object, &ustr, idx);
+            let _outcome = attach_single_device_path(driver_object, &ustr, idx);
+            #[cfg(feature = "attachment-diagnostics")]
+            record_attachment(idx as usize, _outcome);
         }
     }
 
@@ -1152,7 +1173,9 @@ unsafe fn attach_all_storage_targets(driver_object: *mut DRIVER_OBJECT) {
             Buffer: rp_path.as_ptr(),
         };
         unsafe {
-            let _ = attach_single_device_path(driver_object, &ustr, 0);
+            let _outcome = attach_single_device_path(driver_object, &ustr, 0);
+            #[cfg(feature = "attachment-diagnostics")]
+            record_attachment(8 + idx as usize, _outcome);
         }
     }
 
@@ -1169,7 +1192,9 @@ unsafe fn attach_all_storage_targets(driver_object: *mut DRIVER_OBJECT) {
         Buffer: SPACEPORT_PATH.as_ptr(),
     };
     unsafe {
-        let _ = attach_single_device_path(driver_object, &sp_ustr, 0);
+        let _outcome = attach_single_device_path(driver_object, &sp_ustr, 0);
+        #[cfg(feature = "attachment-diagnostics")]
+        record_attachment(12, _outcome);
     }
 }
 

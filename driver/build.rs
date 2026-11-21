@@ -48,6 +48,9 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=ntoskrnl");
 
     // Configure MSVC link.exe to emit a relocatable 64-bit Windows Kernel WDM Driver (.sys)
+    if env::var_os("CARGO_FEATURE_ATTACHMENT_DIAGNOSTICS").is_some() {
+        println!("cargo:rustc-link-arg-bins=/EXPORT:SmbiosAttachmentSnapshot,DATA");
+    }
     println!("cargo:rustc-link-arg-bins=/SUBSYSTEM:NATIVE,10.0");
     println!("cargo:rustc-link-arg-bins=/DRIVER");
     println!("cargo:rustc-link-arg-bins=/FIXED:NO");
