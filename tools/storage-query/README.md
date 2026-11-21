@@ -112,3 +112,48 @@ Get-PhysicalDisk |
    correlated provider and storage I/O traces for that question.
 
 [Storage property query and descriptor contract](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ni-winioctl-ioctl_storage_query_property) · [DUID layout](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/storduid/ns-storduid-_storage_device_unique_identifier)
+
+## Micron 2400 after reboot (PR #7 driver)
+
+The operator observed the following on the same disk. After a live driver reload the direct VPD 0x80 and PhysicalDisk serials both matched the profile. After reboot the ESP profile, direct device descriptor, embedded DUID descriptor, direct VPD 0x80 and Get-Disk all reported `D1F9V96CQUN4DJ7`. Get-PhysicalDisk returned `0000_0000_0000_0001_00A0_7523_453E_0948.`. Removing the separators gives the hex digits of the stable namespace ID `eui.000000000000000100A07523453E0948`. That correspondence makes a namespace-derived display value plausible. It does not identify the component that produced it.
+
+### What the source establishes
+
+- `install.ps1` registers SmbiosDiskFilter as a standalone kernel service with SYSTEM_START and error control IGNORE. Its configuration supplies no ordering guarantee relative to the first provider enumeration.
+- In `driver/src/lib.rs`, DriverEntry accepts the first valid profile from the firmware variable or ESP fallback, runs registry synchronization, then calls `attach_all_storage_targets` once. It tries eight numbered disk paths, four RaidPort paths and Spaceport. It discards each attachment result and returns success after the sweep. There is no later device-arrival retry. A running service cannot identify which targets existed or attached at boot. The Spaceport comment describes an intended target, not an observed provider route.
+- On an attached stack, only classified device-control requests with output capacity receive the patch completion routine. Successful completions use the smaller of returned bytes and requested capacity. Buffered SCSI pass-through interprets only SystemBuffer. The successful direct query demonstrates the observed result for that handle and request, without identifying which attachment handled it.
+- Get-PhysicalDisk enumerates objects exposed by available Storage Management Providers. The earlier CIM trace identifies the class queried. It supplies neither the origin of the serial property nor the time it was populated. [Microsoft Get-PhysicalDisk documentation](https://learn.microsoft.com/en-us/powershell/module/storage/get-physicaldisk)
+
+### Minimum read-only comparison
+
+On the affected boot, run this once in an elevated PowerShell with the already-built diagnostic. Read the physical-disk provider first to keep the direct probe outside its observation window. Match by UniqueId, model and size. Stop if the match is ambiguous.
+
+```powershell
+Get-Date -Format o
+Get-PhysicalDisk | Select-Object DeviceId,FriendlyName,Size,UniqueId,SerialNumber
+Get-Date -Format o
+Get-Disk -Number 0 | Select-Object Number,FriendlyName,Size,UniqueId,SerialNumber
+.\target\x86_64-pc-windows-msvc\debug\storage-query.exe --vpd80
+```
+
+The expected split is recorded above. For the supplied results this comparison is already complete. Repeating it or querying service state cannot resolve the cause. For an **existing boot ETL**, open it in Windows Performance Analyzer and inspect the interval from device arrival through the first provider enumeration, then the timestamped provider-only window above if covered. Correlate activity/related IDs, device instance or target, process/thread and request/completion pairs where recorded. Separate the later direct probe. Apply these evidence criteria:
+
+| Hypothesis | Observation that would distinguish it |
+| --- | --- |
+| Early enumeration and reuse | A correlated early acquisition of the grouped value followed by a provider cache hit or reuse of that object for the later call. Silence in an I/O trace alone is insufficient. |
+| Attachment timing | Evidence of a failed or premature attachment to the specific target later used by the provider, or a target arriving after the one-time sweep. Driver image load alone does not timestamp the attachment. |
+| Alternate request, target or value source | A correlated provider-side acquisition on another target, via another request, or a recorded derivation from a namespace ID. Matching text alone leaves all three open. |
+| Other boot initialization | First population by another component before the provider call, followed by a traceable handoff. Compare boot and existing reload traces only when the same device and events are identifiable. |
+
+A CIM-only trace or an ETL lacking the needed attachment, acquisition or cache events leaves the cause unresolved. The current filter does not emit per-target attachment outcomes. No new kernel instrumentation or boot trace configuration is required by this comparison.
+
+### Separate MachineGuid observation
+
+After profile regeneration with R, the operator observed the previous UUID in MachineGuid. DriverEntry prefers a valid firmware profile to the ESP copy and attempts a registry write for a nonzero loaded UUID. The helper does not report key-open or value-write failures to DriverEntry. The installer also has a separate synchronization path using the Windows-reported SMBIOS UUID. The current disk serial alone cannot establish which UUID was loaded, whether that registry write succeeded, or which writer ran last. Compare the recorded old/new profile UUIDs to these read-only values from the same boot:
+
+```powershell
+(Get-CimInstance Win32_ComputerSystemProduct).UUID
+(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Cryptography').MachineGuid
+```
+
+Both current values establish a snapshot only. Determining writer order requires corresponding historical evidence. This issue is independent of the storage-provider investigation.
