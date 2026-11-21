@@ -695,7 +695,7 @@ mod tests {
         let mut request = [0; 8];
         request[..4].copy_from_slice(&STORAGE_DEVICE_ID_PROPERTY.to_le_bytes());
         let tag = classify_ioctl_request(IOCTL_STORAGE_QUERY_PROPERTY, &request);
-        assert_eq!(tag, TAG_NONE);
+        assert_eq!(tag, TAG_STORAGE_DEVICE_ID);
         assert!(!patch_ioctl_output_by_tag(
             tag,
             &mut buf,
