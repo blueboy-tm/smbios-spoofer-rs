@@ -38,7 +38,7 @@ param(
     [switch]$Headless,
     [switch]$SpoofMac,
     [switch]$SkipTests,
-    [ValidateSet("spaceport-serial-patch", "attachment-diagnostics", "none")]
+    [ValidateSet("spaceport-serial-patch", "spaceport-serial-patch,namespace-id-patch", "attachment-diagnostics", "none")]
     [string]$DriverFeature = "spaceport-serial-patch",
     [string]$UsbDrive = "",
     [switch]$NoElevate,
