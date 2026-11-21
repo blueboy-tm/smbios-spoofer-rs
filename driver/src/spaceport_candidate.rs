@@ -26,7 +26,7 @@ impl Check {
             return (Self::TruncatedField, 0, 0);
         };
         let offset = u32::from_le_bytes([field[0], field[1], field[2], field[3]]) as usize;
-        if offset < OFFSET_FIELD + 4 || offset % 2 != 0 || offset > output.len().saturating_sub(2) {
+        if offset < OFFSET_FIELD + 4 || !offset.is_multiple_of(2) || offset > output.len().saturating_sub(2) {
             return (Self::InvalidOffset, offset, 0);
         }
 
