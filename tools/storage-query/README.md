@@ -260,3 +260,55 @@ VPD 0x80 on the same boot. A successful attachment still leaves the provider's
 request path unresolved.
 
 [Windows device security API](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdmsec/) · [Device characteristics](https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/specifying-device-characteristics)
+
+### Correlate a PhysicalDisk query with ETW
+
+The reported diagnostic boot attached Harddisk0/DR0, RaidPort0 and Spaceport
+(stage 5, status zero). Harddisk1–7 failed lookup with 0xC000003A and
+RaidPort1–3 with 0xC0000034. This rules out a missed attachment to the three
+successful named targets during the sweep. The provider's request path and
+the time that it acquired the serial remain unknown.
+
+Microsoft documents the PhysicalDisk serial as matching the disk's SCSI
+inquiry data, and lists Inquiry-to-Identify translation in StorNVMe. The
+observed grouped value `0000_0000_0000_0001_00A0_7523_453E_0948.` has the same
+hex digits as `eui.000000000000000100A07523453E0948` when separators are
+removed. Earlier hardware results also observed that grouped text directly
+in VPD 0x80. A namespace-derived serial from translation is therefore
+plausible. The text does not locate the transformation or establish that
+Storage Spaces, StorNVMe or a particular cache furnished this instance of
+the property.
+
+From Windows PowerShell at the repository root, run the following on the
+affected boot. Elevate if Windows denies ETW session access.
+
+```powershell
+.\tools\Trace-PhysicalDisk.ps1
+```
+
+The script discovers available candidate Microsoft providers, starts a
+private-named 8 MB circular file capture with a requested 15-second limit,
+and stops it in cleanup around one query with an eight-second job wait.
+It reports the query PID and UTC window, observed event IDs, correlation
+IDs and named EventData fields when present. The temporary ETL can contain
+other system activity and identifier values even though the event summary
+omits payloads. Keep it local and delete it after analysis.
+
+Compare events using the query PID and UTC window. Follow activity and
+related activity IDs where they form an actual join. Inspect the local ETL
+for request and completion fields only if their schemas expose them.
+A provider event plus nearby storage activity does not attribute a serial.
+A request code alone cannot establish that its response was used. If the
+capture lacks a correlation or a serial acquisition event, the source remains
+unresolved. Circular overwrite, unavailable providers and absent event fields
+can all produce gaps. Silence cannot distinguish caching from missing coverage.
+
+The narrowest additional evidence would be a provider-side observation at
+property population that identifies either reuse of a stored value or the
+specific lower result consumed. That would require provider diagnostics or
+an authorized, build-specific debugger session with suitable symbols. A boot
+capture is needed if population precedes the query. Kernel filter logging
+would see only requests reaching its attached stacks and could still miss the
+assignment. This workflow requires neither a filter change nor a restart.
+
+[MSFT_PhysicalDisk](https://learn.microsoft.com/en-us/windows-hardware/drivers/storage/msft-physicaldisk) · [StorNVMe translation](https://learn.microsoft.com/en-us/windows-hardware/drivers/storage/stornvme-scsi-translation-support) · [Logman trace options](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/logman-create-trace)
