@@ -368,21 +368,21 @@ function Get-SpooferFirmwareGuids {
 }
 
 function Register-UefiBootEntry([string]$EspDrive) {
-    # 1. Remove any previous "EFI SMBIOS Spoofer" entries to prevent duplicates
-    $existingGuids = Get-SpooferFirmwareGuids
-    foreach ($oldGuid in $existingGuids) {
-        Write-Step "Removing previous UEFI boot entry $oldGuid..."
-        & bcdedit /delete $oldGuid /f | Out-Null
+    # Reuse the current spoofer entry rather than deleting an active boot path.
+    # Remove duplicate spoofer entries only AFTER successful configuration.
+    $existingGuids = @(Get-SpooferFirmwareGuids)
+    if ($existingGuids.Count -gt 0) {
+        $newGuid = $existingGuids[0]
+        Write-Step "Updating existing UEFI boot entry: $newGuid"
+    } else {
+        Write-Step "Creating UEFI boot entry '$BootEntryDescription' via bcdedit..."
+        $copyOut = (& bcdedit /copy "{bootmgr}" /d $BootEntryDescription 2>&1) | Out-String
+        if ($LASTEXITCODE -ne 0 -or $copyOut -notmatch "(\{[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\})") {
+            throw "Failed to create bcdedit entry: $copyOut"
+        }
+        $newGuid = $Matches[1]
+        Write-Ok "Created UEFI entry: $newGuid"
     }
-
-    # 2. Copy {bootmgr} to create a new firmware application entry
-    Write-Step "Creating UEFI boot entry '$BootEntryDescription' via bcdedit..."
-    $copyOut = (& bcdedit /copy "{bootmgr}" /d $BootEntryDescription 2>&1) | Out-String
-    if ($LASTEXITCODE -ne 0 -or $copyOut -notmatch "(\{[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\})") {
-        throw "Failed to create bcdedit entry: $copyOut"
-    }
-    $newGuid = $Matches[1]
-    Write-Ok "Created UEFI entry: $newGuid"
 
     # 3. Point the entry to ESP:\EFI\SmbiosSpoofer\smbios-spoofer.efi
     & bcdedit /set $newGuid device "partition=$EspDrive" | Out-Null
@@ -401,6 +401,12 @@ function Register-UefiBootEntry([string]$EspDrive) {
         throw "Failed to run 'bcdedit /set {fwbootmgr} displayorder $newGuid /addfirst'"
     }
 
+    foreach ($oldGuid in $existingGuids) {
+        if ($oldGuid -ne $newGuid) {
+            & bcdedit /delete $oldGuid /f | Out-Null
+            if ($LASTEXITCODE -ne 0) { Write-Warn "Could not remove duplicate UEFI entry $oldGuid." }
+        }
+    }
     Write-Ok "UEFI BootOrder configured: $newGuid is now #1 before Windows Boot Manager"
 }
 
@@ -457,7 +463,7 @@ function Invoke-EspInstall {
 
     Write-Host ""
     Write-Host "  ======================================================================" -ForegroundColor Green
-    Write-Host "    INSTALLATION COMPLETED SUCCESSFULLY!" -ForegroundColor Green
+    Write-Host "    INSTALLATION STAGED - REBOOT REQUIRED" -ForegroundColor Green
     Write-Host "  ======================================================================" -ForegroundColor Green
     Write-Host "    - Deployed binary  : $EfiRelPath" -ForegroundColor White
     Write-Host "    - Kernel Filter    : $SystemDriverPath ($DriverServiceName)" -ForegroundColor White
