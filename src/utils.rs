@@ -902,6 +902,24 @@ pub fn generate_disk_serial_matching(buf: &mut [u16; 64], original: &[u16]) {
     generate_serial_matching_format(buf, &trimmed_orig);
 }
 
+/// Check whether an IDENTIFY-reported serial looks like a usable controller serial.
+/// Firmware garbage such as ";;" must never become the serial format template.
+pub fn is_plausible_disk_serial(serial: &[u16]) -> bool {
+    let len = str_len_u16(serial);
+    if !(4..=20).contains(&len) { return false; }
+    let mut alnum = 0usize;
+    for &ch in &serial[..len] {
+        if ch > 0x7f { return false; }
+        let b = ch as u8;
+        if b.is_ascii_alphanumeric() {
+            alnum += 1;
+        } else if !matches!(b, b'_' | b'-' | b'.' | b' ') {
+            return false;
+        }
+    }
+    alnum >= 4
+}
+
 /// Génère un numéro de série de disque déterministe par disque (`seed` + `disk_index`),
 /// afin que chaque disque physique conserve un numéro de série stable d'un boot à l'autre
 /// tout en respectant le masque de caractères du disque d'origine (ex: `S4EVNF0M123456A` ou `ABCD_1234_5678_90AB.`).
@@ -926,9 +944,10 @@ pub fn generate_disk_serial_deterministic(
     };
 
     let orig_len = str_len_u16(original);
-    let len = if orig_len == 0 { 15 } else { orig_len.min(20) };
+    let use_original_format = is_plausible_disk_serial(original) && !is_placeholder(original);
+    let len = if use_original_format { orig_len.min(20) } else { 15 };
 
-    if orig_len == 0 || is_placeholder(original) {
+    if !use_original_format {
         for item in buf.iter_mut().take(len) {
             let r = (next_u32(&mut state) as usize) % SERIAL_CHARSET.len();
             *item = SERIAL_CHARSET[r] as u16;
@@ -984,6 +1003,18 @@ pub fn delay_us(microseconds: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn broken_nvme_serial_is_replaced_with_plausible_serial() {
+        let mut invalid = [0u16; 64];
+        invalid[0] = b';' as u16;
+        invalid[1] = b';' as u16;
+        assert!(!is_plausible_disk_serial(&invalid));
+        let mut generated = [0u16; 64];
+        generate_disk_serial_deterministic(&mut generated, &invalid, 0x1234_5678, 0);
+        assert_eq!(str_len_u16(&generated), 15);
+        assert!(is_plausible_disk_serial(&generated));
+    }
 
     #[test]
     fn test_uuid_v4_version_byte() {
