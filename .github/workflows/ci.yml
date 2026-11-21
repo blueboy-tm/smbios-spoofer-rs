@@ -46,8 +46,28 @@ jobs:
       - name: Build UEFI Release Binary (GOP GUI Mode)
         run: cargo build --release --target x86_64-unknown-uefi
 
-      - name: Build Windows Kernel WDM Disk Filter Driver (.sys)
-        run: cargo build --release --manifest-path driver/Cargo.toml --target x86_64-pc-windows-msvc
+      - name: Validate PowerShell installer syntax
+        shell: powershell
+        run: .\\tools\\test-installer-syntax.ps1
+
+      - name: Unit test standalone WDM diagnostic and patch modules
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($name in @("attachment", "spaceport_candidate", "spaceport_serial_patch")) {
+            $path = "driver/src/$name.rs"
+            $exe = "$env:TEMP/$name-ci-tests.exe"
+            rustc --edition=2024 --test $path -o $exe
+            if ($LASTEXITCODE -ne 0) { throw "Failed to compile $name tests" }
+            & $exe
+            if ($LASTEXITCODE -ne 0) { throw "Failed to run $name tests" }
+          }
+
+      - name: Lint experimental Spaceport Windows driver feature
+        run: cargo clippy --manifest-path driver/Cargo.toml --target x86_64-pc-windows-msvc --features spaceport-serial-patch -- -D warnings
+
+      - name: Build Windows Kernel WDM Disk Filter Driver (.sys, Spaceport feature)
+        run: cargo build --release --manifest-path driver/Cargo.toml --target x86_64-pc-windows-msvc --features spaceport-serial-patch
 
       - name: Upload smbios-spoofer.efi Artifact
         uses: actions/upload-artifact@v4

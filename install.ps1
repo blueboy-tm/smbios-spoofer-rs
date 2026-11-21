@@ -11,8 +11,13 @@
                                   and configures the UEFI BootOrder entry #1 automatically via bcdedit.
       - status                  : Displays Windows CIM and registry identifiers, compares them with
                                   the snapshot, and checks the ESP profile, firmware entries, and driver service.
-      - build-only              : Runs unit tests and compiles the UEFI binary (.efi) only.
-      - install-only            : Deploys an already built .efi binary to the ESP and configures bcdedit.
+      - build-only              : Runs unit tests and compiles UEFI + selected Windows driver.
+      - install-only            : Deploys built UEFI + driver artifacts, signs/installs versioned driver.
+      - install-driver          : Builds and installs Windows driver only.
+      - audit-drivers           : Read-only inventory of driver service, files and disk identities.
+      - cleanup-drivers         : Disables/deletes only this project driver and removes test images.
+                                  Rerun after reboot to remove the formerly loaded image.
+      - uninstall-driver        : Same driver cleanup without removing the EFI profile or boot entry.
       - reset-profile           : Removes the persisted profile (\EFI\SmbiosSpoofer\uuid.dat) to force
                                   generating new IDs on next reboot.
       - uninstall               : Removes the UEFI boot entry (bcdedit) and cleans up the ESP partition.
@@ -27,12 +32,14 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet("install", "status", "uninstall", "build-only", "install-only", "install-driver", "uninstall-driver", "reset-profile", "backup-profile", "restore-profile")]
+    [ValidateSet("install", "status", "uninstall", "build-only", "install-only", "install-driver", "uninstall-driver", "audit-drivers", "cleanup-drivers", "reset-profile", "backup-profile", "restore-profile")]
     [string]$Mode = "install",
 
     [switch]$Headless,
     [switch]$SpoofMac,
     [switch]$SkipTests,
+    [ValidateSet("spaceport-serial-patch", "attachment-diagnostics", "none")]
+    [string]$DriverFeature = "spaceport-serial-patch",
     [string]$UsbDrive = "",
     [switch]$NoElevate,
     [switch]$PauseOnExit
@@ -107,6 +114,7 @@ function Request-AdminElevation([string]$TargetMode = $Mode) {
     if ($Headless)  { $argList += "-Headless" }
     if ($SpoofMac)  { $argList += "-SpoofMac" }
     if ($SkipTests) { $argList += "-SkipTests" }
+    $argList += @("-DriverFeature", $DriverFeature)
     if ($UsbDrive)  { $argList += @("-UsbDrive", "`"$UsbDrive`"") }
 
     try {
@@ -242,6 +250,39 @@ function Ensure-RustToolchain {
 
 # --- Build & Unit Tests ------------------------------------------------------
 
+function Invoke-DriverBuild {
+    Ensure-RustToolchain
+    if (-not $SkipTests) {
+        foreach ($module in @("attachment", "spaceport_candidate", "spaceport_serial_patch")) {
+            $testSource = Join-Path $ProjectRoot "driver\src\$module.rs"
+            $testExe = Join-Path $env:TEMP ("smbios-" + $module + "-" + [guid]::NewGuid().ToString("N") + ".exe")
+            try {
+                Write-Step "Running standalone driver tests: $module"
+                & rustc --edition=2024 --test $testSource -o $testExe
+                if ($LASTEXITCODE -ne 0) { throw "$module test compilation failed." }
+                & $testExe
+                if ($LASTEXITCODE -ne 0) { throw "$module unit tests failed." }
+            } finally {
+                Remove-Item -LiteralPath $testExe -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    $featureArgs = @()
+    if ($DriverFeature -ne "none") { $featureArgs = @("--features", $DriverFeature) }
+    Write-Step "Clippy for Windows driver (feature=$DriverFeature)..."
+    & cargo clippy --manifest-path $DriverManifestPath --target x86_64-pc-windows-msvc @featureArgs -- -D warnings
+    if ($LASTEXITCODE -ne 0) { throw "Kernel driver Clippy failed." }
+
+    Write-Step "Building Windows kernel driver (feature=$DriverFeature)..."
+    & cargo build --release --manifest-path $DriverManifestPath --target x86_64-pc-windows-msvc @featureArgs
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $BuiltDriverPath)) {
+        throw "Kernel driver release build failed. Refusing to install old artifacts."
+    }
+    Copy-Item -LiteralPath $BuiltDriverPath -Destination $LocalDriverCopy -Force -ErrorAction Stop
+    Write-Ok "Prepared driver: $LocalDriverCopy ($DriverFeature)"
+}
+
 function Invoke-ProjectBuild {
     Ensure-RustToolchain
 
@@ -251,7 +292,7 @@ function Invoke-ProjectBuild {
         if ($LASTEXITCODE -ne 0) {
             throw "Unit tests failed. Aborting build."
         }
-        Write-Ok "All unit tests passed (134/134)"
+        Write-Ok "UEFI/host unit tests passed."
     }
 
     $features = @()
@@ -277,17 +318,7 @@ function Invoke-ProjectBuild {
     Write-Ok "UEFI binary compiled : $BuiltEfiPath ($sizeKB KB)"
     Write-Ok "Local copy updated   : $LocalEfiCopy"
 
-    if (Test-Path $DriverManifestPath) {
-        Write-Step "Compiling Windows Kernel WDM Disk Filter Driver (smbios-disk-filter.sys)..."
-        & cargo build --release --manifest-path $DriverManifestPath --target x86_64-pc-windows-msvc
-        if ($LASTEXITCODE -eq 0 -and (Test-Path $BuiltDriverPath)) {
-            Copy-Item -Path $BuiltDriverPath -Destination $LocalDriverCopy -Force
-            $drvKB = [math]::Round((Get-Item $LocalDriverCopy).Length / 1KB, 1)
-            Write-Ok "Kernel driver built  : $LocalDriverCopy ($drvKB KB)"
-        } else {
-            Write-Warn "Kernel driver build skipped or failed (UEFI binary is still ready)."
-        }
-    }
+    Invoke-DriverBuild
 }
 
 # --- Safe EFI System Partition (ESP) Mount / Unmount -------------------------
@@ -337,21 +368,21 @@ function Get-SpooferFirmwareGuids {
 }
 
 function Register-UefiBootEntry([string]$EspDrive) {
-    # 1. Remove any previous "EFI SMBIOS Spoofer" entries to prevent duplicates
-    $existingGuids = Get-SpooferFirmwareGuids
-    foreach ($oldGuid in $existingGuids) {
-        Write-Step "Removing previous UEFI boot entry $oldGuid..."
-        & bcdedit /delete $oldGuid /f | Out-Null
+    # Reuse the current spoofer entry rather than deleting an active boot path.
+    # Remove duplicate spoofer entries only AFTER successful configuration.
+    $existingGuids = @(Get-SpooferFirmwareGuids)
+    if ($existingGuids.Count -gt 0) {
+        $newGuid = $existingGuids[0]
+        Write-Step "Updating existing UEFI boot entry: $newGuid"
+    } else {
+        Write-Step "Creating UEFI boot entry '$BootEntryDescription' via bcdedit..."
+        $copyOut = (& bcdedit /copy "{bootmgr}" /d $BootEntryDescription 2>&1) | Out-String
+        if ($LASTEXITCODE -ne 0 -or $copyOut -notmatch "(\{[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\})") {
+            throw "Failed to create bcdedit entry: $copyOut"
+        }
+        $newGuid = $Matches[1]
+        Write-Ok "Created UEFI entry: $newGuid"
     }
-
-    # 2. Copy {bootmgr} to create a new firmware application entry
-    Write-Step "Creating UEFI boot entry '$BootEntryDescription' via bcdedit..."
-    $copyOut = (& bcdedit /copy "{bootmgr}" /d $BootEntryDescription 2>&1) | Out-String
-    if ($LASTEXITCODE -ne 0 -or $copyOut -notmatch "(\{[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\})") {
-        throw "Failed to create bcdedit entry: $copyOut"
-    }
-    $newGuid = $Matches[1]
-    Write-Ok "Created UEFI entry: $newGuid"
 
     # 3. Point the entry to ESP:\EFI\SmbiosSpoofer\smbios-spoofer.efi
     & bcdedit /set $newGuid device "partition=$EspDrive" | Out-Null
@@ -370,6 +401,12 @@ function Register-UefiBootEntry([string]$EspDrive) {
         throw "Failed to run 'bcdedit /set {fwbootmgr} displayorder $newGuid /addfirst'"
     }
 
+    foreach ($oldGuid in $existingGuids) {
+        if ($oldGuid -ne $newGuid) {
+            & bcdedit /delete $oldGuid /f | Out-Null
+            if ($LASTEXITCODE -ne 0) { Write-Warn "Could not remove duplicate UEFI entry $oldGuid." }
+        }
+    }
     Write-Ok "UEFI BootOrder configured: $newGuid is now #1 before Windows Boot Manager"
 }
 
@@ -399,6 +436,13 @@ function Invoke-EspInstall {
         return
     }
 
+    # Validate/sign/stage the Windows driver BEFORE changing the EFI boot entry.
+    # If signing fails, the existing UEFI configuration stays untouched.
+    if (-not (Test-Path -LiteralPath $LocalDriverCopy)) {
+        throw "Driver build artifact missing. Run .\\install.ps1 -Mode build-only first."
+    }
+    Install-WindowsDiskFilterDriver
+
     Invoke-WithMountedEsp {
         param($espDrive)
 
@@ -419,13 +463,9 @@ function Invoke-EspInstall {
         Register-UefiBootEntry -EspDrive $espDrive
     }
 
-    if (Test-Path $LocalDriverCopy) {
-        Install-WindowsDiskFilterDriver
-    }
-
     Write-Host ""
     Write-Host "  ======================================================================" -ForegroundColor Green
-    Write-Host "    INSTALLATION COMPLETED SUCCESSFULLY!" -ForegroundColor Green
+    Write-Host "    INSTALLATION STAGED - REBOOT REQUIRED" -ForegroundColor Green
     Write-Host "  ======================================================================" -ForegroundColor Green
     Write-Host "    - Deployed binary  : $EfiRelPath" -ForegroundColor White
     Write-Host "    - Kernel Filter    : $SystemDriverPath ($DriverServiceName)" -ForegroundColor White
@@ -439,178 +479,8 @@ function Invoke-EspInstall {
     Write-Host ""
 }
 
-# --- Windows Kernel WDM Disk Filter Driver Management ------------------------
-
-function Install-WindowsDiskFilterDriver {
-    if (-not (Test-Path $LocalDriverCopy)) {
-        if (Test-Path $BuiltDriverPath) {
-            Copy-Item -Path $BuiltDriverPath -Destination $LocalDriverCopy -Force
-        } else {
-            Write-Warn "smbios-disk-filter.sys not found. Run '.\install.ps1 -Mode build-only' first."
-            return
-        }
-    }
-
-    Write-Step "Configuring Windows Kernel Disk Serial Filter ($DriverServiceName)..."
-
-    # 1. Enable testsigning in BCD (required for local self-signed kernel drivers)
-    $bcdCurrent = (& bcdedit /enum "{current}" 2>&1) | Out-String
-    if ($bcdCurrent -notmatch "testsigning\s+Yes") {
-        $tsOut = (& bcdedit /set "{current}" testsigning on 2>&1) | Out-String
-        if ($LASTEXITCODE -eq 0) {
-            Write-Ok "Enabled Windows Test-Signing mode (bcdedit /set testsigning on) -- takes effect on next reboot."
-        } else {
-            Write-Warn "Could not enable testsigning automatically (Secure Boot may still be ON in BIOS: $($tsOut.Trim()))."
-        }
-    } else {
-        Write-Ok "Windows Test-Signing mode is already active."
-    }
-
-    # 2. Validate CNG private key by actually signing test data (HasPrivateKey alone is insufficient).
-    function Test-CodeSigningKey($candidate) {
-        $rsa = $null
-        try {
-            $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($candidate)
-            if ($null -eq $rsa) { return $false }
-            $proof = $rsa.SignData([byte[]](1,2,3,4), [System.Security.Cryptography.HashAlgorithmName]::SHA256, [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
-            return ($proof.Length -gt 0)
-        } catch {
-            return $false
-        } finally {
-            if ($null -ne $rsa) { $rsa.Dispose() }
-        }
-    }
-
-    $certSubject = "CN=SmbiosSpooferKernelCert"
-    $cert = $null
-    $candidates = @(Get-ChildItem Cert:\LocalMachine\My -CodeSigningCert -ErrorAction SilentlyContinue | Where-Object { $_.Subject -eq $certSubject } | Sort-Object NotBefore -Descending)
-    foreach ($candidate in $candidates) {
-        if (Test-CodeSigningKey $candidate) {
-            $cert = $candidate
-            break
-        }
-        Write-Warn "Ignoring certificate $($candidate.Thumbprint): private key is unusable or missing."
-    }
-    if (-not $cert) {
-        Write-Step "Creating a new code-signing certificate (no usable existing key found)..."
-        $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject $certSubject -Provider "Microsoft Software Key Storage Provider" -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 -CertStoreLocation "Cert:\LocalMachine\My" -NotAfter (Get-Date).AddYears(10) -ErrorAction Stop
-        if (-not (Test-CodeSigningKey $cert)) {
-            throw "New signing certificate has no working private key; refusing to install."
-        }
-    }
-
-    foreach ($storeName in @("Root", "TrustedPublisher")) {
-        $store = New-Object System.Security.Cryptography.X509Certificates.X509Store($storeName, "LocalMachine")
-        try {
-            $store.Open("ReadWrite")
-            if (-not ($store.Certificates | Where-Object { $_.Thumbprint -eq $cert.Thumbprint })) {
-                $store.Add($cert)
-            }
-        } finally {
-            $store.Close()
-        }
-    }
-
-    # Sign a staged copy, verify, then deploy; never install unsigned files as fallback.
-    $stagedDriver = Join-Path $env:TEMP ("smbios-disk-filter-" + [guid]::NewGuid().ToString("N") + ".sys")
-    try {
-        Copy-Item -Path $LocalDriverCopy -Destination $stagedDriver -Force -ErrorAction Stop
-        $signTool = Get-Command signtool.exe -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source
-        if (-not $signTool) {
-            $sdkRoot = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) "Windows Kits\10\bin"
-            if (Test-Path $sdkRoot) {
-                $signTool = Get-ChildItem $sdkRoot -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
-            }
-        }
-        if (-not $signTool) { throw "Windows SDK signtool.exe (x64) not found." }
-
-        & $signTool sign /v /fd SHA256 /s My /sm /sha1 $cert.Thumbprint $stagedDriver
-        if ($LASTEXITCODE -ne 0) {
-            throw "SignTool failed to sign staged driver (exit code $LASTEXITCODE)."
-        }
-        $check = Get-AuthenticodeSignature -FilePath $stagedDriver
-        if ($check.Status -ne "Valid") {
-            throw "Driver signature verification failed: $($check.Status). Refusing to deploy."
-        }
-        Copy-Item -Path $stagedDriver -Destination $SystemDriverPath -Force -ErrorAction Stop
-        $installedSig = Get-AuthenticodeSignature -FilePath $SystemDriverPath
-        if ($installedSig.Status -ne "Valid") {
-            throw "Installed driver failed signature verification: $($installedSig.Status)."
-        }
-        Write-Ok "Signed and verified kernel filter: $SystemDriverPath ($($cert.Thumbprint))"
-    } finally {
-        Remove-Item -Path $stagedDriver -Force -ErrorAction SilentlyContinue
-    }
-
-    # 3. Register standalone kernel service (start= system, safe: never causes 0x7B if blocked)
-    $existingSvc = Get-Service -Name $DriverServiceName -ErrorAction SilentlyContinue
-    if (-not $existingSvc) {
-        & sc.exe create $DriverServiceName type= kernel start= system error= ignore binPath= "System32\drivers\smbios-disk-filter.sys" DisplayName= "SMBIOS Disk Serial Filter" | Out-Null
-        Write-Ok "Registered kernel service '$DriverServiceName' (Start = SYSTEM_START, ErrorControl = Ignore)"
-    } else {
-        & sc.exe config $DriverServiceName type= kernel start= system error= ignore binPath= "System32\drivers\smbios-disk-filter.sys" | Out-Null
-        Write-Ok "Updated kernel service '$DriverServiceName' configuration"
-    }
-
-    # 4. Attempt live start if Test-Signing is already active in the current session
-    try {
-        Start-Service -Name $DriverServiceName -ErrorAction Stop
-        Write-Ok "Kernel filter '$DriverServiceName' is RUNNING live! Refreshing WMI storage cache..."
-    } catch {
-        $svcNow = Get-Service -Name $DriverServiceName -ErrorAction SilentlyContinue
-        if ($svcNow -and $svcNow.Status -eq 'Running') {
-            Write-Ok "Kernel filter '$DriverServiceName' is already RUNNING!"
-        } else {
-            Write-Warn "Kernel filter '$DriverServiceName' staged for next boot (reboot required after enabling testsigning)."
-        }
-    }
-
-    Sync-WindowsRuntimeRegistry
-}
-
-function Sync-WindowsRuntimeRegistry {
-    if (-not (Test-IsAdmin)) { return }
-    Write-Step "Synchronizing Windows Registry telemetry (DEVICEMAP\Scsi, ComputerHardwareId, MachineGuid)..."
-    $curr = Get-CurrentSmbiosSnapshot
-
-    # 1. Sync HKLM\HARDWARE\DEVICEMAP\Scsi\...\SerialNumber with the spoofed Win32_DiskDrive serial
-    if ($curr.DiskDrives.Count -gt 0 -and $curr.DiskDrives[0].SerialNumber) {
-        $spoofDiskSer = $curr.DiskDrives[0].SerialNumber
-        $regVal = if ($spoofDiskSer -match "_[0-9A-Fa-f]{8}\.$") { $spoofDiskSer } else { $spoofDiskSer.PadRight(20) + "_00000001." }
-        Get-ChildItem "HKLM:\HARDWARE\DEVICEMAP\Scsi" -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
-            $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
-            if ($p -and $p.SerialNumber) {
-                Set-ItemProperty -Path $_.PSPath -Name "SerialNumber" -Value $regVal -ErrorAction SilentlyContinue
-            }
-        }
-        Write-Ok "Synced HKLM\HARDWARE\DEVICEMAP\Scsi SerialNumber -> $regVal"
-    }
-
-    # 2. Sync ComputerHardwareId & MachineGuid from spoofed SMBIOS System UUID
-    if (-not [string]::IsNullOrWhiteSpace($curr.UUID) -and $curr.UUID -match "^[0-9A-Fa-f-]{36}$") {
-        $uuidLower = $curr.UUID.ToLower()
-        $uuidBraced = "{$uuidLower}"
-        Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SystemInformation" -Name "ComputerHardwareId" -Value $uuidBraced -ErrorAction SilentlyContinue
-        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Cryptography" -Name "MachineGuid" -Value $uuidLower -ErrorAction SilentlyContinue
-        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\SQMClient" -Name "MachineId" -Value ($uuidBraced.ToUpper()) -ErrorAction SilentlyContinue
-        Write-Ok "Synced ComputerHardwareId & MachineGuid -> $uuidLower"
-    }
-
-    Restart-Service -Name "smphost" -Force -ErrorAction SilentlyContinue
-    Update-StorageProviderCache -DiscoveryLevel Full -ErrorAction SilentlyContinue | Out-Null
-}
-
-function Uninstall-WindowsDiskFilterDriver {
-    $existingSvc = Get-Service -Name $DriverServiceName -ErrorAction SilentlyContinue
-    if ($existingSvc) {
-        & sc.exe delete $DriverServiceName | Out-Null
-        Write-Ok "Removed kernel service '$DriverServiceName' (will unload after next reboot)."
-    }
-    if (Test-Path $SystemDriverPath) {
-        Remove-Item -Path $SystemDriverPath -Force -ErrorAction SilentlyContinue
-        Write-Ok "Removed driver file: $SystemDriverPath"
-    }
-}
+# Driver signing, versioned staging and cleanup are implemented in tools/driver-lifecycle.ps1.
+# This script does not rewrite MachineGuid, ComputerHardwareId or Storage registry keys.
 
 # --- Status / Verification Mode ----------------------------------------------
 
@@ -681,22 +551,6 @@ function Show-EspProfileStatus([string]$Path) {
     } else {
         Write-Warn "ESP uuid.dat invalid. $($result.Reason)"
     }
-}
-
-function Show-DriverServiceStatus {
-    Write-Host ""
-    Write-Step "Kernel driver service state (Win32_SystemDriver)"
-    try {
-        $service = Get-CimInstance -ClassName Win32_SystemDriver -Filter "Name = '$DriverServiceName'" -ErrorAction Stop
-        if ($service) {
-            Write-Host "    $($service.Name) : $($service.State)"
-        } else {
-            Write-Warn "Kernel driver service '$DriverServiceName' was not found."
-        }
-    } catch {
-        Write-Warn "Could not query '$DriverServiceName' ($($_.Exception.Message))."
-    }
-    Write-Host "    Service state only. IOCTL interception requires a separate test."
 }
 
 function Show-FieldComparison([string]$Label, [string]$Current, [string]$Before) {
@@ -890,6 +744,9 @@ function Invoke-Uninstall {
     Write-Ok "Uninstallation complete. On next reboot, your original hardware SMBIOS identifiers will be restored."
 }
 
+# --- Driver lifecycle helpers -------------------------------------------------
+. (Join-Path $ProjectRoot "tools\driver-lifecycle.ps1")
+
 # --- Main Entrypoint ---------------------------------------------------------
 
 Write-Banner
@@ -914,8 +771,16 @@ switch ($Mode) {
         Invoke-EspInstall
     }
     "install-driver" {
+        Invoke-DriverBuild
         Request-AdminElevation -TargetMode "install-driver"
         Install-WindowsDiskFilterDriver
+    }
+    "audit-drivers" {
+        Show-DriverServiceStatus
+    }
+    "cleanup-drivers" {
+        Request-AdminElevation -TargetMode "cleanup-drivers"
+        Uninstall-WindowsDiskFilterDriver
     }
     "uninstall-driver" {
         Request-AdminElevation -TargetMode "uninstall-driver"

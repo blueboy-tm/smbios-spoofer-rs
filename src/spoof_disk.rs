@@ -941,6 +941,8 @@ pub fn spoof_disks(_config: &SpoofConfig) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::string::String;
+    use alloc::vec;
 
     fn str_to_u16_buf(s: &str) -> [u16; 64] {
         let mut buf = [0u16; 64];
