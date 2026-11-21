@@ -64,7 +64,7 @@ pub fn rewrite_device_id(response: &mut [u8], serial: &[u8; 20]) -> bool {
     let Some(id) = response.get_mut(start..start + OLD_ID.len()) else {
         return false;
     };
-    if id != OLD_ID { return false; }
+    if &*id != OLD_ID.as_slice() { return false; }
     id.copy_from_slice(&new_id);
     true
 }
@@ -125,7 +125,7 @@ mod tests {
         let before = out.clone();
         assert!(rewrite_device_id(&mut out, SERIAL));
         assert_eq!(&out[..28], &before[..28]);
-        assert_ne!(&out[28..64], OLD_ID);
+        assert_ne!(&out[28..64], OLD_ID.as_slice());
         assert_eq!(&out[28..32], b"eui.");
         assert!(out[32..64].iter().all(u8::is_ascii_hexdigit));
         assert!(!rewrite_device_id(&mut out, SERIAL));
