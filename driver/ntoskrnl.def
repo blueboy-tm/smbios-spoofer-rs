@@ -1,5 +1,6 @@
 LIBRARY ntoskrnl.exe
 EXPORTS
+    KeQueryInterruptTimePrecise
     IoCreateDevice
     IoDeleteDevice
     IoDetachDevice
