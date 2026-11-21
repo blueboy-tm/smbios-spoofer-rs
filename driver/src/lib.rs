@@ -40,8 +40,6 @@ static SmbiosAttachmentSnapshot: [attachment::Record; 13] =
 static SmbiosSpaceportIoctlSnapshot: attachment::SpaceportIoctlCounters =
     attachment::SpaceportIoctlCounters::empty();
 
-#[cfg(feature = "attachment-diagnostics")]
-const SPACEPORT_DRIVE_INFO_IOCTL: u32 = 0x00E7_0408;
 const TAG_SPACEPORT_DIAGNOSTIC: u8 = 0xFE;
 
 #[cfg(feature = "attachment-diagnostics")]
@@ -991,7 +989,11 @@ unsafe extern "system" fn dispatch_device_control(
 
             let tag = win_disk_patch::classify_ioctl_request(ioctl, input_slice);
             #[cfg(feature = "attachment-diagnostics")]
-            let tag = if (*ext).is_spaceport != 0 && ioctl == SPACEPORT_DRIVE_INFO_IOCTL {
+            let tag = if attachment::should_count_spaceport(
+                (*ext).is_spaceport != 0,
+                ioctl,
+                out_len,
+            ) {
                 // Observe this request only. Never access or rewrite its buffer.
                 TAG_SPACEPORT_DIAGNOSTIC
             } else {
