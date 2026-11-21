@@ -147,9 +147,10 @@ pub fn patch_ioctl_output_with_namespace_id(
         TAG_STORAGE_DEVICE_UNIQUE_ID => {
             // Keep the already working embedded serial rewrite and additionally
             // update the independent identifier descriptor, if it exactly matches.
-            let serial = patch_storage_device_unique_id(buf, new_serial);
-            let id = namespace_id_patch::rewrite_duid_id(buf, new_serial);
-            serial || id
+            let _serial_changed = patch_storage_device_unique_id(buf, new_serial);
+            // Return only whether the identifier changed, not whether the
+            // separate embedded serial patch changed; counters need to distinguish these.
+            namespace_id_patch::rewrite_duid_id(buf, new_serial)
         }
         _ => patch_ioctl_output_by_tag(tag, buf, new_serial),
     }
