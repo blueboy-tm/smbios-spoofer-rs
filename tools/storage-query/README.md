@@ -286,22 +286,27 @@ affected boot. Elevate if Windows denies ETW session access.
 .\tools\Trace-PhysicalDisk.ps1
 ```
 
-The script discovers available candidate Microsoft providers, starts a
-private-named 8 MB circular file capture with a requested 15-second limit,
-and stops it in cleanup around one query with an eight-second job wait.
-It reports the query PID and UTC window, observed event IDs, correlation
-IDs and named EventData fields when present. The temporary ETL can contain
-other system activity and identifier values even though the event summary
-omits payloads. Keep it local and delete it after analysis.
+The script supports Windows PowerShell 5.1. It starts a uniquely named 8 MB
+circular ETL and waits up to eight seconds for one query. It stops the session
+in cleanup and retries a failed stop. If both attempts fail or the PowerShell
+process is forcibly terminated, use `logman query -ets` to find the session
+named `PhysicalDisk-<id>`, then run `logman stop PhysicalDisk-<id> -ets` for
+that session only. The ETL path is printed on cleanup. The raw ETL may contain
+unrelated activity and identifiers. Keep it local and delete it after analysis.
 
-Compare events using the query PID and UTC window. Follow activity and
-related activity IDs where they form an actual join. Inspect the local ETL
-for request and completion fields only if their schemas expose them.
-A provider event plus nearby storage activity does not attribute a serial.
-A request code alone cannot establish that its response was used. If the
-capture lacks a correlation or a serial acquisition event, the source remains
-unresolved. Circular overwrite, unavailable providers and absent event fields
-can all produce gaps. Silence cannot distinguish caching from missing coverage.
+The report counts providers and event IDs across the whole ETL. It then uses
+XML timestamps with explicit UTC conversion to select the query window.
+The WMI section seeds correlation from the payload client PID, then follows
+activity and related activity IDs among in-window WMI records. The ETW header
+PID identifies the emitting process and is shown separately. Operation and
+namespace values are allowlisted. Raw serials and free-form messages are omitted.
+
+In the reported capture, event 11 linked an `IWbemServices::Connect` operation
+in `root/cimv2` to the query client PID. The linked debug records did not
+identify the PhysicalDisk serial acquisition. Nearby StorPort events cannot
+establish that their responses supplied SerialNumber. An empty ETL, a populated
+ETL without in-window records, and correlated WMI with unresolved serial
+acquisition are distinct results.
 
 The narrowest additional evidence would be a provider-side observation at
 property population that identifies either reuse of a stored value or the
