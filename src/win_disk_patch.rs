@@ -6,11 +6,12 @@
 //! Handles all 5 Windows disk serial query vectors:
 //! 1. `IOCTL_STORAGE_QUERY_PROPERTY` (`0x002D1400`):
 //!    - `StorageDeviceProperty (0)` -> `STORAGE_DEVICE_DESCRIPTOR`
-//!    - `StorageDeviceIdProperty (2)` -> `STORAGE_DEVICE_ID_DESCRIPTOR` (VPD 0x83)
+//!    - `StorageDeviceUniqueIdProperty (3)` -> only the embedded device descriptor serial
+//!    - `StorageDeviceIdProperty (2)` -> passed through (VPD 0x83 identifiers)
 //!    - `StorageAdapterProtocolSpecificProperty (49)` / `StorageDeviceProtocolSpecificProperty (50)`
 //!      -> `STORAGE_PROTOCOL_DATA_DESCRIPTOR` (NVMe 4096-byte Identify Controller & ATA 512-byte Identify)
 //!    - `StorageAdapterSerialNumberProperty (56)` -> `STORAGE_ADAPTER_SERIAL_NUMBER` (UTF-16LE)
-//! 2. `IOCTL_STORAGE_PROTOCOL_COMMAND` (`0x002D14E0` / `0x002D53C0`)
+//! 2. `IOCTL_STORAGE_PROTOCOL_COMMAND` (`0x002DD3C0` / `0x002D13C0`)
 //! 3. `SMART_RCV_DRIVE_DATA` (`0x0007C088`) -> `SENDCMDOUTPARAMS` (ATA word-swapped serial)
 //! 4. `IOCTL_ATA_PASS_THROUGH` (`0x0004D02C`) -> `ATA_PASS_THROUGH_EX`
 //! 5. `IOCTL_SCSI_PASS_THROUGH` (`0x0004D004`) / SCSI `INQUIRY` VPD Page `0x80`
@@ -56,7 +57,6 @@ pub const PROTOCOL_DATA_TYPE_IDENTIFY: u32 = 1;
 // Completion context tags packed into the upper 32 bits of `Context`
 pub const TAG_NONE: u8 = 0;
 pub const TAG_STORAGE_DEVICE_DESCRIPTOR: u8 = 1;
-pub const TAG_STORAGE_DEVICE_ID_DESCRIPTOR: u8 = 2;
 pub const TAG_STORAGE_PROTOCOL_DESCRIPTOR: u8 = 3;
 pub const TAG_STORAGE_ADAPTER_SERIAL: u8 = 4;
 pub const TAG_STORAGE_PROTOCOL_COMMAND: u8 = 5;
@@ -64,7 +64,6 @@ pub const TAG_SMART_RCV_DRIVE_DATA: u8 = 6;
 pub const TAG_ATA_PASS_THROUGH: u8 = 7;
 pub const TAG_SCSI_PASS_THROUGH: u8 = 8;
 pub const TAG_STORAGE_DEVICE_UNIQUE_ID: u8 = 9;
-pub const TAG_GENERIC_SUBSTRING_SCAN: u8 = 10;
 
 /// Inspects an incoming `IRP_MJ_DEVICE_CONTROL` request (`io_control_code` and `system_buffer`)
 /// BEFORE the lower driver overwrites `SystemBuffer`, and returns the completion tag (`TAG_*`)
@@ -84,14 +83,14 @@ pub fn classify_ioctl_request(io_control_code: u32, input_buf: &[u8]) -> u8 {
             }
             match property_id {
                 STORAGE_DEVICE_PROPERTY => TAG_STORAGE_DEVICE_DESCRIPTOR,
-                STORAGE_DEVICE_ID_PROPERTY => TAG_STORAGE_DEVICE_ID_DESCRIPTOR,
+                STORAGE_DEVICE_ID_PROPERTY => TAG_NONE, // VPD 0x83 contains device identifiers.
                 STORAGE_DEVICE_UNIQUE_ID_PROPERTY => TAG_STORAGE_DEVICE_UNIQUE_ID,
                 STORAGE_ADAPTER_PROTOCOL_SPECIFIC_PROPERTY
                 | STORAGE_DEVICE_PROTOCOL_SPECIFIC_PROPERTY
                 | STORAGE_ADAPTER_PROTOCOL_SPECIFIC_PROPERTY_EX
                 | STORAGE_DEVICE_PROTOCOL_SPECIFIC_PROPERTY_EX => TAG_STORAGE_PROTOCOL_DESCRIPTOR,
                 STORAGE_ADAPTER_SERIAL_NUMBER_PROPERTY => TAG_STORAGE_ADAPTER_SERIAL,
-                _ => TAG_GENERIC_SUBSTRING_SCAN,
+                _ => TAG_NONE,
             }
         }
         IOCTL_STORAGE_PROTOCOL_COMMAND | IOCTL_STORAGE_PROTOCOL_COMMAND_ALT => {
@@ -100,29 +99,15 @@ pub fn classify_ioctl_request(io_control_code: u32, input_buf: &[u8]) -> u8 {
         SMART_RCV_DRIVE_DATA => TAG_SMART_RCV_DRIVE_DATA,
         IOCTL_ATA_PASS_THROUGH => TAG_ATA_PASS_THROUGH,
         IOCTL_SCSI_PASS_THROUGH => TAG_SCSI_PASS_THROUGH,
-        _ => {
-            // If METHOD_BUFFERED (low 2 bits == 0), allow substring scan on completion
-            if (io_control_code & 0x3) == 0 {
-                TAG_GENERIC_SUBSTRING_SCAN
-            } else {
-                TAG_NONE
-            }
-        }
+        _ => TAG_NONE,
     }
 }
 
 /// Dispatches the appropriate in-place buffer patcher based on `tag`.
-pub fn patch_ioctl_output_by_tag(
-    tag: u8,
-    buf: &mut [u8],
-    new_serial: &[u8; 20],
-    seed: u64,
-) -> bool {
+pub fn patch_ioctl_output_by_tag(tag: u8, buf: &mut [u8], new_serial: &[u8; 20]) -> bool {
     match tag {
         TAG_STORAGE_DEVICE_DESCRIPTOR => patch_storage_device_descriptor(buf, new_serial),
-        TAG_STORAGE_DEVICE_ID_DESCRIPTOR => {
-            patch_storage_device_id_descriptor(buf, new_serial, seed)
-        }
+        TAG_STORAGE_DEVICE_UNIQUE_ID => patch_storage_device_unique_id(buf, new_serial),
         TAG_STORAGE_PROTOCOL_DESCRIPTOR => patch_storage_protocol_descriptor(buf, new_serial),
         TAG_STORAGE_ADAPTER_SERIAL => patch_storage_adapter_serial_number(buf, new_serial),
         TAG_STORAGE_PROTOCOL_COMMAND => patch_storage_protocol_command(buf, new_serial),
@@ -138,7 +123,13 @@ pub fn patch_ioctl_output_by_tag(
 /// - Leading/trailing ASCII space padding (`0x20`)
 /// - Hex-encoded serials (when `disk.sys` hex-encodes a 20-byte serial into 40 hex chars)
 pub fn patch_ascii_serial_slice(serial_slice: &mut [u8], new_serial: &[u8; 20]) -> bool {
-    if serial_slice.is_empty() {
+    // Some responses expose a namespace designator where a unit serial is expected.
+    let unpadded = serial_slice.trim_ascii_start();
+    if unpadded.is_empty()
+        || unpadded
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"eui."))
+    {
         return false;
     }
 
@@ -219,108 +210,53 @@ pub fn patch_storage_device_descriptor(buf: &mut [u8], new_serial: &[u8; 20]) ->
         return false;
     }
     let serial_offset = u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]) as usize;
-    if serial_offset < 28 || serial_offset >= buf.len() {
+    if serial_offset < 36 || serial_offset >= buf.len() {
         return false;
     }
 
-    // Find null terminator starting at `serial_offset`
-    let max_rem = buf.len() - serial_offset;
-    let mut str_len = 0usize;
-    while str_len < max_rem && buf[serial_offset + str_len] != 0 {
-        str_len += 1;
-    }
-    if str_len == 0 {
+    let serial = &mut buf[serial_offset..];
+    let Some(end) = serial.iter().position(|&byte| byte == 0) else {
         return false;
-    }
-
-    patch_ascii_serial_slice(
-        &mut buf[serial_offset..serial_offset + str_len],
-        new_serial,
-    )
+    };
+    patch_ascii_serial_slice(&mut serial[..end], new_serial)
 }
 
-/// 1B. Patches `STORAGE_DEVICE_ID_DESCRIPTOR` (`IOCTL_STORAGE_QUERY_PROPERTY`, `PropertyId = 2`).
-///
-/// Layout (`ntddstor.h`):
-/// - `0..4`: `Version: u32`
-/// - `4..8`: `Size: u32`
-/// - `8..12`: `NumberOfIdentifiers: u32`
-/// - `12..`: Array of `STORAGE_IDENTIFIER`:
-///   - `+0..4`: `CodeSet: u32` (`1 = Binary`, `2 = Ascii`, `3 = Utf8`)
-///   - `+4..8`: `Type: u32`
-///   - `+8..10`: `IdentifierSize: u16`
-///   - `+10..12`: `NextOffset: u16`
-///   - `+12..16`: `Association: u32`
-///   - `+16..16 + IdentifierSize`: `Identifier` bytes
-pub fn patch_storage_device_id_descriptor(
-    buf: &mut [u8],
-    new_serial: &[u8; 20],
-    seed: u64,
-) -> bool {
-    if buf.len() < 16 {
+/// Patches only the serial in the DUID's embedded `STORAGE_DEVICE_DESCRIPTOR`.
+fn patch_storage_device_unique_id(buf: &mut [u8], new_serial: &[u8; 20]) -> bool {
+    const HEADER_SIZE: usize = 20;
+    if buf.len() < HEADER_SIZE {
         return false;
     }
-    let num_ids = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]) as usize;
-    if num_ids == 0 || num_ids > 32 {
+    let size = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
+    let id_offset = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
+    let device_offset = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
+    let layout_offset = u32::from_le_bytes(buf[16..20].try_into().unwrap()) as usize;
+    if device_offset < HEADER_SIZE || device_offset >= size || size > buf.len() {
         return false;
     }
 
-    let mut offset = 12usize;
-    let mut patched = false;
-    let seed_bytes = seed.to_le_bytes();
-
-    for _ in 0..num_ids {
-        if offset + 16 > buf.len() {
-            break;
+    // Stop before any following identifier or layout signature.
+    let mut end = size;
+    for offset in [id_offset, layout_offset] {
+        if offset == 0 {
+            continue;
         }
-        let code_set = u32::from_le_bytes([
-            buf[offset],
-            buf[offset + 1],
-            buf[offset + 2],
-            buf[offset + 3],
-        ]);
-        let id_size = u16::from_le_bytes([buf[offset + 8], buf[offset + 9]]) as usize;
-        let next_offset = u16::from_le_bytes([buf[offset + 10], buf[offset + 11]]) as usize;
-        let id_start = offset + 16;
-
-        if id_size > 0 && id_start + id_size <= buf.len() {
-            let id_slice = &mut buf[id_start..id_start + id_size];
-            if code_set == 2 || code_set == 3 {
-                // ASCII or UTF-8 VPD 0x83 identifier (often contains Vendor + Model + NSID + Serial)
-                if id_slice.len() >= 20 {
-                    let tail_len = if find_stornvme_nsid_suffix(id_slice).is_some() {
-                        30
-                    } else {
-                        20
-                    };
-                    let tail_start = id_slice.len().saturating_sub(tail_len);
-                    patch_ascii_serial_slice(&mut id_slice[tail_start..], new_serial);
-                } else {
-                    patch_ascii_serial_slice(id_slice, new_serial);
-                }
-                patched = true;
-            } else if code_set == 1 && id_slice.len() >= 8 {
-                // Binary EUI-64 (8 bytes) or NGUID (16 bytes):
-                // Preserve first 3 bytes (IEEE OUI vendor prefix), deterministically mutate device extension bytes
-                for (i, b) in id_slice[3..].iter_mut().enumerate() {
-                    let mix = seed_bytes[i % 8] ^ new_serial[i % 20];
-                    if mix != 0 {
-                        *b ^= mix;
-                    } else {
-                        *b = b.wrapping_add(0x5A);
-                    }
-                }
-                patched = true;
-            }
+        if offset < HEADER_SIZE || offset >= size || offset == device_offset {
+            return false;
         }
-
-        if next_offset == 0 {
-            break;
+        if offset > device_offset {
+            end = end.min(offset);
         }
-        offset = offset.saturating_add(next_offset);
     }
-
-    patched
+    let device = &mut buf[device_offset..end];
+    let Some(size_bytes) = device.get(4..8) else {
+        return false;
+    };
+    let device_size = u32::from_le_bytes(size_bytes.try_into().unwrap()) as usize;
+    let Some(device) = device.get_mut(..device_size) else {
+        return false;
+    };
+    patch_storage_device_descriptor(device, new_serial)
 }
 
 /// 1C. Patches `STORAGE_PROTOCOL_DATA_DESCRIPTOR` (`IOCTL_STORAGE_QUERY_PROPERTY`, `PropertyId = 49 / 50`).
@@ -350,23 +286,17 @@ pub fn patch_storage_protocol_descriptor(buf: &mut [u8], new_serial: &[u8; 20]) 
 
     // `ProtocolDataOffset` is measured from the start of `STORAGE_PROTOCOL_SPECIFIC_DATA` (offset 8)
     let abs_offset = 8usize.saturating_add(data_offset);
-    if abs_offset >= buf.len() {
+    if data_offset < 40 || abs_offset >= buf.len() {
         return false;
     }
 
     if protocol_type == PROTOCOL_TYPE_NVME {
-        // NVMe Identify Controller (`CNS == 1`, or 4096-byte buffer with ASCII SN at 4..24)
-        if abs_offset + 64 <= buf.len() && data_len >= 64 {
-            let ident = &mut buf[abs_offset..];
-            if request_val == 1 || is_printable_ascii(&ident[4..24]) {
-                ident[4..24].copy_from_slice(new_serial);
-                return true;
-            }
+        // Only Identify Controller (CNS = 1) defines a serial at bytes 4..24.
+        if request_val == 1 && abs_offset + 64 <= buf.len() && data_len >= 64 {
+            buf[abs_offset + 4..abs_offset + 24].copy_from_slice(new_serial);
+            return true;
         }
-    } else if protocol_type == PROTOCOL_TYPE_ATA
-        && abs_offset + 40 <= buf.len()
-        && data_len >= 40
-    {
+    } else if protocol_type == PROTOCOL_TYPE_ATA && abs_offset + 40 <= buf.len() && data_len >= 40 {
         write_ata_word_swapped(&mut buf[abs_offset + 20..abs_offset + 40], new_serial);
         return true;
     }
@@ -411,28 +341,41 @@ pub fn patch_storage_adapter_serial_number(buf: &mut [u8], new_serial: &[u8; 20]
 ///
 /// Layout (`ntddstor.h`):
 /// - `8..12`: `ProtocolType: u32` (`3 = ProtocolTypeNvme`)
-/// - `32..36`: `DataFromDeviceTransferLength: u32`
-/// - `48..52`: `DataFromDeviceBufferOffset: u32`
+/// - `24..28`: `CommandLength: u32`
+/// - `36..40`: `DataFromDeviceTransferLength: u32`
+/// - `52..56`: `DataFromDeviceBufferOffset: u32`
+/// - `80..`: `Command` (64 bytes for NVMe, with CNS at byte 40)
 pub fn patch_storage_protocol_command(buf: &mut [u8], new_serial: &[u8; 20]) -> bool {
-    if buf.len() < 56 {
+    const COMMAND_OFFSET: usize = 80;
+    const NVME_COMMAND_SIZE: usize = 64;
+    const NVME_IDENTIFY_OPCODE: u8 = 0x06;
+    const NVME_IDENTIFY_CONTROLLER_CNS: u8 = 1;
+    if buf.len() < COMMAND_OFFSET + NVME_COMMAND_SIZE {
         return false;
     }
-    let protocol_type = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
-    let from_len = u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]) as usize;
-    let from_offset = u32::from_le_bytes([buf[48], buf[49], buf[50], buf[51]]) as usize;
+    let protocol_type = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+    let command_len = u32::from_le_bytes(buf[24..28].try_into().unwrap()) as usize;
+    let from_len = u32::from_le_bytes(buf[36..40].try_into().unwrap()) as usize;
+    let from_offset = u32::from_le_bytes(buf[52..56].try_into().unwrap()) as usize;
 
-    if protocol_type == PROTOCOL_TYPE_NVME
-        && from_len >= 64
-        && from_offset >= 52
-        && from_offset + 64 <= buf.len()
+    if protocol_type != PROTOCOL_TYPE_NVME
+        || command_len != NVME_COMMAND_SIZE
+        || buf[COMMAND_OFFSET] != NVME_IDENTIFY_OPCODE
+        || buf[COMMAND_OFFSET + 40] != NVME_IDENTIFY_CONTROLLER_CNS
+        || from_len < 64
+        || from_offset < COMMAND_OFFSET + NVME_COMMAND_SIZE
     {
-        let data = &mut buf[from_offset..];
-        if is_printable_ascii(&data[4..24]) && is_printable_ascii(&data[24..64]) {
-            data[4..24].copy_from_slice(new_serial);
-            return true;
-        }
+        return false;
     }
-    false
+    let Some(data) = buf.get_mut(from_offset..) else {
+        return false;
+    };
+    if data.len() < 64 {
+        return false;
+    }
+
+    data[4..24].copy_from_slice(new_serial);
+    true
 }
 
 /// 3. Patches `SENDCMDOUTPARAMS` (`SMART_RCV_DRIVE_DATA`).
@@ -509,72 +452,6 @@ pub fn patch_scsi_vpd_inquiry(inq: &mut [u8], new_serial: &[u8; 20]) -> bool {
     false
 }
 
-/// Scans `buf` for any ASCII or UTF-16LE occurrences of the original disk serial prefix
-/// (`orig_serial` trimmed of trailing spaces) and replaces them in-place with `new_serial`.
-///
-/// This catches `StorageDeviceUniqueIdProperty (3)`, `\Device\Spaceport` (`Get-PhysicalDisk`),
-/// and custom vendor IOCTLs that embed the factory serial inside composite descriptors.
-pub fn patch_buffer_occurrences_ascii_and_utf16(
-    buf: &mut [u8],
-    orig_serial: &[u8; 20],
-    new_serial: &[u8; 20],
-) -> bool {
-    // Compute trimmed non-space length of `orig_serial`
-    let mut orig_len = orig_serial.len();
-    while orig_len > 0 && (orig_serial[orig_len - 1] == b' ' || orig_serial[orig_len - 1] == 0) {
-        orig_len -= 1;
-    }
-    if orig_len < 6 || buf.len() < orig_len {
-        return false;
-    }
-
-    let orig_prefix = &orig_serial[..orig_len];
-    let mut patched = false;
-
-    // 1. Scan for ASCII occurrences of `orig_prefix`
-    let mut i = 0usize;
-    while i + orig_len <= buf.len() {
-        if &buf[i..i + orig_len] == orig_prefix {
-            for k in 0..orig_len {
-                let rep = new_serial[k];
-                buf[i + k] = if rep != b' ' && rep != 0 { rep } else { b'0' };
-            }
-            patched = true;
-            i += orig_len;
-        } else {
-            i += 1;
-        }
-    }
-
-    // 2. Scan for UTF-16LE occurrences of `orig_prefix` (`2 * orig_len` bytes)
-    let utf16_len = orig_len * 2;
-    if buf.len() >= utf16_len {
-        let mut j = 0usize;
-        while j + utf16_len <= buf.len() {
-            let mut matches = true;
-            for k in 0..orig_len {
-                if buf[j + k * 2] != orig_prefix[k] || buf[j + k * 2 + 1] != 0 {
-                    matches = false;
-                    break;
-                }
-            }
-            if matches {
-                for k in 0..orig_len {
-                    let rep = new_serial[k];
-                    buf[j + k * 2] = if rep != b' ' && rep != 0 { rep } else { b'0' };
-                    buf[j + k * 2 + 1] = 0;
-                }
-                patched = true;
-                j += utf16_len;
-            } else {
-                j += 1;
-            }
-        }
-    }
-
-    patched
-}
-
 #[inline]
 fn write_ata_word_swapped(dst_20: &mut [u8], new_serial: &[u8; 20]) {
     for i in (0..20).step_by(2) {
@@ -600,6 +477,131 @@ fn is_printable_ascii(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_storage_device_id_preserves_reported_eui() {
+        let eui = b"eui.000000000000000100A07523453E0948";
+        let mut buf = [0u8; 28 + 36];
+        let size = buf.len() as u32;
+        buf[..4].copy_from_slice(&16u32.to_le_bytes());
+        buf[4..8].copy_from_slice(&size.to_le_bytes());
+        buf[8..12].copy_from_slice(&1u32.to_le_bytes());
+        buf[12..16].copy_from_slice(&3u32.to_le_bytes()); // UTF-8
+        buf[16..20].copy_from_slice(&8u32.to_le_bytes()); // SCSI name string
+        buf[20..22].copy_from_slice(&(eui.len() as u16).to_le_bytes());
+        buf[28..].copy_from_slice(eui);
+
+        let mut request = [0; 8];
+        request[..4].copy_from_slice(&STORAGE_DEVICE_ID_PROPERTY.to_le_bytes());
+        let tag = classify_ioctl_request(IOCTL_STORAGE_QUERY_PROPERTY, &request);
+        assert_eq!(tag, TAG_NONE);
+        assert!(!patch_ioctl_output_by_tag(
+            tag,
+            &mut buf,
+            b"YPAF58TWVPR65HW     "
+        ));
+
+        // The old 20-byte tail rewrite produced eui.000000000000YPAF58TWVPR65HW.
+        assert_eq!(&buf[28..], eui);
+    }
+
+    #[test]
+    fn test_storage_device_id_preserves_binary_namespace_ids() {
+        let mut buf = [0u8; 12 + 16 + 8 + 16 + 16];
+        let size = buf.len() as u32;
+        buf[..4].copy_from_slice(&16u32.to_le_bytes());
+        buf[4..8].copy_from_slice(&size.to_le_bytes());
+        buf[8..12].copy_from_slice(&2u32.to_le_bytes());
+        buf[12..16].copy_from_slice(&1u32.to_le_bytes()); // Binary
+        buf[16..20].copy_from_slice(&2u32.to_le_bytes()); // EUI-64 type
+        buf[20..22].copy_from_slice(&8u16.to_le_bytes());
+        buf[22..24].copy_from_slice(&24u16.to_le_bytes()); // NextOffset
+        buf[28..36].copy_from_slice(&[0x00, 0xa0, 0x75, 0x23, 0x45, 0x3e, 0x09, 0x48]);
+        buf[36..40].copy_from_slice(&1u32.to_le_bytes()); // Binary
+        buf[40..44].copy_from_slice(&2u32.to_le_bytes()); // EUI type with 16-byte NGUID
+        buf[44..46].copy_from_slice(&16u16.to_le_bytes());
+        buf[52..68].copy_from_slice(&[
+            0, 0, 0, 0, 0, 0, 0, 1, 0x00, 0xa0, 0x75, 0x23, 0x45, 0x3e, 0x09, 0x48,
+        ]);
+
+        let mut request = [0; 8];
+        request[..4].copy_from_slice(&STORAGE_DEVICE_ID_PROPERTY.to_le_bytes());
+        let tag = classify_ioctl_request(IOCTL_STORAGE_QUERY_PROPERTY, &request);
+        let original = buf;
+        assert!(!patch_ioctl_output_by_tag(
+            tag,
+            &mut buf,
+            b"YPAF58TWVPR65HW     "
+        ));
+        assert_eq!(buf, original);
+    }
+
+    #[test]
+    fn test_storage_unique_id_patches_only_embedded_serial() {
+        // Intentionally use the same hex suffix in the namespace identifier and serial.
+        let serial = b"00A07523453E0948";
+        let mut buf = [0u8; 20 + 28 + 36 + 36 + 16 + 1 + 8];
+        let size = buf.len() as u32;
+        buf[..4].copy_from_slice(&1u32.to_le_bytes());
+        buf[4..8].copy_from_slice(&size.to_le_bytes());
+        buf[8..12].copy_from_slice(&20u32.to_le_bytes());
+        buf[12..16].copy_from_slice(&84u32.to_le_bytes());
+        buf[16..20].copy_from_slice(&137u32.to_le_bytes());
+        let id = &mut buf[20..84];
+        id[..4].copy_from_slice(&16u32.to_le_bytes());
+        id[4..8].copy_from_slice(&64u32.to_le_bytes());
+        id[8..12].copy_from_slice(&1u32.to_le_bytes());
+        id[12..16].copy_from_slice(&3u32.to_le_bytes());
+        id[16..20].copy_from_slice(&8u32.to_le_bytes());
+        id[20..22].copy_from_slice(&36u16.to_le_bytes());
+        id[28..].copy_from_slice(b"eui.000000000000000100A07523453E0948");
+        let device = &mut buf[84..137];
+        device[..4].copy_from_slice(&36u32.to_le_bytes());
+        device[4..8].copy_from_slice(&53u32.to_le_bytes());
+        device[24..28].copy_from_slice(&36u32.to_le_bytes());
+        device[36..52].copy_from_slice(serial);
+        buf[137..].copy_from_slice(b"12345678");
+
+        let mut request = [0; 8];
+        request[..4].copy_from_slice(&STORAGE_DEVICE_UNIQUE_ID_PROPERTY.to_le_bytes());
+        let tag = classify_ioctl_request(IOCTL_STORAGE_QUERY_PROPERTY, &request);
+        let mut expected = buf;
+        expected[120..136].copy_from_slice(b"YPAF58TWVPR65HW ");
+        assert!(patch_ioctl_output_by_tag(
+            tag,
+            &mut buf,
+            b"YPAF58TWVPR65HW     "
+        ));
+        assert_eq!(buf, expected);
+
+        // An embedded descriptor claiming the layout signature's bytes must be ignored.
+        buf[88..92].copy_from_slice(&54u32.to_le_bytes());
+        let original = buf;
+        assert!(!patch_ioctl_output_by_tag(
+            tag,
+            &mut buf,
+            b"DIFFERENT-SERIAL    "
+        ));
+        assert_eq!(buf, original);
+    }
+
+    #[test]
+    fn test_ascii_serial_patcher_preserves_eui_designators() {
+        let mut id = *b" EUI.000000000000000100A07523453E0948";
+        let original = id;
+        assert!(!patch_ascii_serial_slice(&mut id, b"YPAF58TWVPR65HW     "));
+        assert_eq!(id, original);
+    }
+
+    #[test]
+    fn test_opaque_ioctl_outputs_are_not_scanned() {
+        let request = [0xff, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(
+            classify_ioctl_request(IOCTL_STORAGE_QUERY_PROPERTY, &request),
+            TAG_NONE
+        );
+        assert_eq!(classify_ioctl_request(0x8000_2000, &[]), TAG_NONE);
+    }
 
     #[test]
     fn test_long_registry_serial_pads_instead_of_repeating_first_char() {
@@ -637,7 +639,7 @@ mod tests {
         let tag = classify_ioctl_request(IOCTL_STORAGE_QUERY_PROPERTY, &req);
         assert_eq!(tag, TAG_STORAGE_DEVICE_DESCRIPTOR);
 
-        assert!(patch_ioctl_output_by_tag(tag, &mut buf, new_serial, 0x1234));
+        assert!(patch_ioctl_output_by_tag(tag, &mut buf, new_serial));
         assert_eq!(&buf[40..70], b"CA54N299714909Q56   _00000001.");
         assert_eq!(buf[70], 0);
     }
@@ -668,6 +670,50 @@ mod tests {
     }
 
     #[test]
+    fn test_nvme_identify_namespace_does_not_infer_a_controller_serial() {
+        let mut buf = [0u8; 48 + 4096];
+        buf[8..12].copy_from_slice(&PROTOCOL_TYPE_NVME.to_le_bytes());
+        buf[12..16].copy_from_slice(&PROTOCOL_DATA_TYPE_IDENTIFY.to_le_bytes());
+        buf[24..28].copy_from_slice(&40u32.to_le_bytes());
+        buf[28..32].copy_from_slice(&4096u32.to_le_bytes());
+        // A namespace identifier list may contain entirely printable payload bytes.
+        buf[16..20].copy_from_slice(&3u32.to_le_bytes()); // CNS = Namespace Identification Descriptor List
+        buf[48..52].copy_from_slice(&[3, 16, 0, 0]); // UUID descriptor
+        buf[52..68].copy_from_slice(b"ABCDEFGHIJKLMNOP");
+        buf[68..72].copy_from_slice(&[1, 8, 0, 0]); // EUI-64 descriptor
+        let original = buf;
+        let serial = b"YPAF58TWVPR65HW     ";
+        assert!(!patch_ioctl_output_by_tag(
+            TAG_STORAGE_PROTOCOL_DESCRIPTOR,
+            &mut buf,
+            serial
+        ));
+        assert_eq!(buf, original);
+    }
+
+    #[test]
+    fn test_nvme_protocol_command_patches_only_identify_controller() {
+        let mut buf = [0u8; 144 + 4096];
+        buf[8..12].copy_from_slice(&PROTOCOL_TYPE_NVME.to_le_bytes());
+        buf[24..28].copy_from_slice(&64u32.to_le_bytes());
+        buf[36..40].copy_from_slice(&4096u32.to_le_bytes());
+        buf[52..56].copy_from_slice(&144u32.to_le_bytes());
+        buf[80] = 0x06; // Identify opcode
+        buf[148..168].copy_from_slice(b"CDA7N706410107T15   ");
+        let serial = b"YPAF58TWVPR65HW     ";
+
+        let original = buf;
+        assert!(!patch_storage_protocol_command(&mut buf, serial)); // CNS = 0 (Namespace)
+        assert_eq!(buf, original);
+
+        buf[120] = 1; // CNS = Identify Controller
+        let mut expected = buf;
+        expected[148..168].copy_from_slice(serial);
+        assert!(patch_storage_protocol_command(&mut buf, serial));
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
     fn test_patch_smart_rcv_drive_data_word_swapped() {
         let mut buf = [0u8; 528];
         buf[0..4].copy_from_slice(&512u32.to_le_bytes());
@@ -694,50 +740,6 @@ mod tests {
         for (i, &b) in new_serial.iter().enumerate() {
             assert_eq!(buf[8 + i * 2], b);
             assert_eq!(buf[8 + i * 2 + 1], 0);
-        }
-    }
-
-    #[test]
-    fn test_patch_vpd83_t10_unique_id_preserves_nsid() {
-        // Exact 68-byte VPD 0x83 string observed on SK Hynix NVMe:
-        // "1C5CHFM001TD3JX013N                         0001CDA7N706410107T15   "
-        let vpd_str = b"1C5CHFM001TD3JX013N                         0001CDA7N706410107T15   ";
-        let mut buf = [0u8; 12 + 16 + 68];
-        let total_size = buf.len() as u32;
-        buf[0..4].copy_from_slice(&1u32.to_le_bytes()); // Version
-        buf[4..8].copy_from_slice(&total_size.to_le_bytes()); // Size
-        buf[8..12].copy_from_slice(&1u32.to_le_bytes()); // NumberOfIdentifiers = 1
-        // STORAGE_IDENTIFIER at offset 12:
-        buf[12..16].copy_from_slice(&2u32.to_le_bytes()); // CodeSet = 2 (Ascii)
-        buf[20..22].copy_from_slice(&68u16.to_le_bytes()); // IdentifierSize = 68
-        buf[28..28 + 68].copy_from_slice(vpd_str);
-
-        let new_serial = b"YF0W826954803M86Y   ";
-        assert!(patch_storage_device_id_descriptor(&mut buf, new_serial, 0x9999));
-        assert_eq!(
-            &buf[28..28 + 68],
-            b"1C5CHFM001TD3JX013N                         0001YF0W826954803M86Y   "
-        );
-    }
-
-    #[test]
-    fn test_patch_buffer_occurrences_ascii_and_utf16() {
-        let orig = b"CDA7N706410107T15   ";
-        let spoof = b"YF0W826954803M86Y   ";
-        let mut buf = [0u8; 128];
-        // Place ASCII at offset 8
-        buf[8..38].copy_from_slice(b"CDA7N706410107T15   _00000001.");
-        // Place UTF-16LE at offset 48
-        for (i, &b) in b"CDA7N706410107T15".iter().enumerate() {
-            buf[48 + i * 2] = b;
-            buf[48 + i * 2 + 1] = 0;
-        }
-
-        assert!(patch_buffer_occurrences_ascii_and_utf16(&mut buf, orig, spoof));
-        assert_eq!(&buf[8..38], b"YF0W826954803M86Y   _00000001.");
-        for (i, &b) in b"YF0W826954803M86Y".iter().enumerate() {
-            assert_eq!(buf[48 + i * 2], b);
-            assert_eq!(buf[48 + i * 2 + 1], 0);
         }
     }
 }
