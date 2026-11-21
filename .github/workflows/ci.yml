@@ -54,7 +54,7 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
-          foreach ($name in @("attachment", "spaceport_candidate", "spaceport_serial_patch")) {
+          foreach ($name in @("attachment", "spaceport_candidate", "spaceport_serial_patch", "namespace_id_patch")) {
             $path = "driver/src/$name.rs"
             $exe = "$env:TEMP/$name-ci-tests.exe"
             rustc --edition=2024 --test $path -o $exe
@@ -64,10 +64,10 @@ jobs:
           }
 
       - name: Lint experimental Spaceport Windows driver feature
-        run: cargo clippy --manifest-path driver/Cargo.toml --target x86_64-pc-windows-msvc --features spaceport-serial-patch -- -D warnings
+        run: cargo clippy --manifest-path driver/Cargo.toml --target x86_64-pc-windows-msvc --features spaceport-serial-patch,namespace-id-patch -- -D warnings
 
       - name: Build Windows Kernel WDM Disk Filter Driver (.sys, Spaceport feature)
-        run: cargo build --release --manifest-path driver/Cargo.toml --target x86_64-pc-windows-msvc --features spaceport-serial-patch
+        run: cargo build --release --manifest-path driver/Cargo.toml --target x86_64-pc-windows-msvc --features spaceport-serial-patch,namespace-id-patch
 
       - name: Upload smbios-spoofer.efi Artifact
         uses: actions/upload-artifact@v4
