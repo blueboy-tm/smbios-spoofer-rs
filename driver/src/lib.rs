@@ -57,6 +57,7 @@ static SmbiosSpaceportSerialPatchSnapshot: spaceport_serial_patch::PatchSnapshot
     spaceport_serial_patch::PatchSnapshot::empty();
 
 #[cfg(feature = "namespace-id-patch")]
+#[allow(non_upper_case_globals)] // Keep the symbol discoverable in kernel debuggers.
 #[unsafe(no_mangle)]
 pub static SmbiosNamespaceIdCounters: namespace_id_diagnostics::NamespaceIdCounters =
     namespace_id_diagnostics::NamespaceIdCounters::empty();
