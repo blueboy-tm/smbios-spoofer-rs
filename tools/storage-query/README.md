@@ -468,3 +468,52 @@ Build via `cargo build --release --manifest-path driver/Cargo.toml
 --target x86_64-pc-windows-msvc --features attachment-diagnostics`.
 Deploy only after reviewing the impact of running another completion callback
 in the existing bounded unload/rundown implementation.
+
+
+### Experimental opt-in Spaceport serial rewrite (Micron 2400 observation only)
+
+The `spaceport-serial-patch` Cargo feature automatically includes
+`attachment-diagnostics`. It is **not** enabled in default builds.
+This diagnostic experiment operates only on completion of the existing
+Spaceport IOCTL `0x00E70408` with exact `STATUS_SUCCESS`, a nonzero
+`IoStatus.Information` no larger than the caller's output capacity,
+and a non-null `SystemBuffer`.
+
+The patcher checks that the LE u32 value at output `0xA3C` equals
+`0xBE4`, and that a full 40-code-unit UTF-16LE string and its NUL
+terminator fit in the completed response. It checks that the old
+UTF-16LE contents **exactly equal**
+`0000_0000_0000_0001_00A0_7523_453E_0948.`. Only after every
+guard passes does it rewrite those same 41 UTF-16 units to the
+validated, space-padded v9 profile disk serial followed by zeroes.
+No response offsets, lengths, EUI fields or other bytes are modified.
+The patch does not run on unrelated disks or versions where the old
+serial differs; a new observation is necessary before extending it.
+
+This approach is intentionally tied to a single observed machine and
+response layout; a successful shape check alone did not validate the
+consumer's aliasing of the string. **Although the code does not write
+the UniqueId field, the provider could derive it from the same string.**
+Verify `Get-PhysicalDisk.UniqueId` and disk functionality before and
+after each test. The existing bounded unload rundown remains unresolved.
+Do not stop/reload the running driver; use the signed test copy and
+next-boot service-path switch demonstrated for earlier diagnostics.
+
+An additional debugger snapshot `SmbiosSpaceportSerialPatchSnapshot`
+contains three QWORDs: attempts, successful patches and last result.
+Result codes: 1 patched; 2 response too short; 3 unexpected offset;
+4 different old serial; 5 invalid/missing v9 replacement. Any zero
+attempt count means the guarded callback did not run. This snapshot
+contains **no serial contents**.
+
+Host-only unit tests:
+```powershell
+rustc --edition=2024 --test driver/src/spaceport_serial_patch.rs -o "$env:TEMP\spaceport_serial_patch_tests.exe"
+& "$env:TEMP\spaceport_serial_patch_tests.exe" --nocapture
+```
+
+Build explicitly:
+```powershell
+cargo clippy --manifest-path driver/Cargo.toml --target x86_64-pc-windows-msvc --features spaceport-serial-patch -- -D warnings
+cargo build --release --manifest-path driver/Cargo.toml --target x86_64-pc-windows-msvc --features spaceport-serial-patch
+```
