@@ -119,16 +119,18 @@ pub fn patch_ioctl_output_by_tag(tag: u8, buf: &mut [u8], new_serial: &[u8; 20])
 }
 
 /// Patches an ASCII serial number slice in-place while preserving:
+/// - Namespace designators written as `eui.` or eight groups of four hex digits
 /// - `stornvme.sys` namespace suffixes such as `"   _00000001."` (`20-byte SN` + `_` + `8-hex NSID` + `.`)
 /// - Leading/trailing ASCII space padding (`0x20`)
 /// - Hex-encoded serials (when `disk.sys` hex-encodes a 20-byte serial into 40 hex chars)
 pub fn patch_ascii_serial_slice(serial_slice: &mut [u8], new_serial: &[u8; 20]) -> bool {
     // Some responses expose a namespace designator where a unit serial is expected.
-    let unpadded = serial_slice.trim_ascii_start();
+    let unpadded = serial_slice.trim_ascii();
     if unpadded.is_empty()
         || unpadded
             .get(..4)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"eui."))
+        || is_grouped_namespace_designator(unpadded)
     {
         return false;
     }
@@ -156,6 +158,19 @@ pub fn patch_ascii_serial_slice(serial_slice: &mut [u8], new_serial: &[u8; 20]) 
     true
 }
 
+fn is_grouped_namespace_designator(value: &[u8]) -> bool {
+    let designator =
+        find_stornvme_nsid_suffix(value).map_or(value, |offset| value[..offset].trim_ascii_end());
+    let Some(groups) = designator.strip_suffix(b".") else {
+        return false;
+    };
+    // 32 hex digits and seven underscores, as in the Windows-reported Micron value.
+    groups.len() == 39
+        && groups
+            .split(|&byte| byte == b'_')
+            .all(|group| group.len() == 4 && group.iter().all(u8::is_ascii_hexdigit))
+}
+
 /// Detects the `_00000001.` suffix synthesized by `stornvme.sys` (`_<8 hex digits>.`)
 /// and returns the index of the `_` separator.
 fn find_stornvme_nsid_suffix(s: &[u8]) -> Option<usize> {
@@ -165,9 +180,7 @@ fn find_stornvme_nsid_suffix(s: &[u8]) -> Option<usize> {
     }
     let suffix_start = s.len() - 10;
     let suffix = &s[suffix_start..];
-    if suffix[0] == b'_'
-        && suffix[9] == b'.'
-        && suffix[1..9].iter().all(|&c| c.is_ascii_hexdigit())
+    if suffix[0] == b'_' && suffix[9] == b'.' && suffix[1..9].iter().all(|&c| c.is_ascii_hexdigit())
     {
         return Some(suffix_start);
     }
@@ -594,6 +607,26 @@ mod tests {
     }
 
     #[test]
+    fn test_storage_device_descriptor_preserves_micron_namespace_designator() {
+        const DESIGNATOR: &[u8] = b"0000_0000_0000_0001_00A0_7523_453E_0948.\0";
+        let mut buf = [0u8; 40 + DESIGNATOR.len()];
+        let size = buf.len() as u32;
+        buf[..4].copy_from_slice(&40u32.to_le_bytes());
+        buf[4..8].copy_from_slice(&size.to_le_bytes());
+        buf[24..28].copy_from_slice(&40u32.to_le_bytes());
+        buf[40..].copy_from_slice(DESIGNATOR);
+
+        let tag = classify_ioctl_request(IOCTL_STORAGE_QUERY_PROPERTY, &[0; 8]);
+        let original = buf;
+        assert!(!patch_ioctl_output_by_tag(
+            tag,
+            &mut buf,
+            b"XKNVHETV1TXQNT3     "
+        ));
+        assert_eq!(buf, original);
+    }
+
+    #[test]
     fn test_opaque_ioctl_outputs_are_not_scanned() {
         let request = [0xff, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(
@@ -605,9 +638,8 @@ mod tests {
 
     #[test]
     fn test_long_registry_serial_pads_instead_of_repeating_first_char() {
-        // Regression: a 44-character Windows-reported identifier was rewritten
-        // with repeated leading serial bytes ("CCCC...") after source exhaustion.
-        let mut serial = *b"0000_0000_0000_0001_00A0_7523_453E_0948.";
+        // Ordinary long serials still use space padding after source exhaustion.
+        let mut serial = *b"LONG-WINDOWS-SERIAL-12345678901234567890";
         let spoof = *b"CA54N299714909Q56   ";
         assert!(patch_ascii_serial_slice(&mut serial, &spoof));
         assert_eq!(&serial[..17], b"CA54N299714909Q56");
@@ -615,13 +647,20 @@ mod tests {
     }
 
     #[test]
-    fn test_long_registry_serial_preserves_namespace_suffix() {
-        let mut serial = *b"0000_0000_0000_0001_00A0_7523_453E_0948._00000001.";
+    fn test_registry_serial_patcher_preserves_padded_namespace_designator_and_suffix() {
+        let mut serial = *b" 0000_0000_0000_0001_00a0_7523_453e_0948._00000001. ";
+        let original = serial;
         let spoof = *b"CA54N299714909Q56   ";
+        assert!(!patch_ascii_serial_slice(&mut serial, &spoof));
+        assert_eq!(serial, original);
+    }
+
+    #[test]
+    fn test_non_hex_grouped_serial_is_still_patched() {
+        let mut serial = *b"0000_0000_0000_0001_00G0_7523_453E_0948.";
+        let spoof = *b"XKNVHETV1TXQNT3     ";
         assert!(patch_ascii_serial_slice(&mut serial, &spoof));
-        assert_eq!(&serial[..17], b"CA54N299714909Q56");
-        assert!(serial[17..serial.len() - 10].iter().all(|&b| b == b' '));
-        assert_eq!(&serial[serial.len() - 10..], b"_00000001.");
+        assert_eq!(&serial[..spoof.len()], spoof);
     }
 
     #[test]

@@ -1,7 +1,6 @@
 //! `smbios-disk-filter.sys` — Windows Kernel WDM Storage Filter Driver (`Ring 0`, `#![no_std]`).
 //!
-//! Synchronizes the NVMe/SATA/SCSI disk serial number generated in UEFI (`SmbiosSpoof` v9)
-//! across the `ExitBootServices()` boundary into Windows (`stornvme.sys` / `disk.sys` / `spaceport.sys` / WMI).
+//! Applies the UEFI profile's configured NVMe/SATA/SCSI disk serial to supported Windows storage responses.
 //!
 //! ### Architecture
 //! 1. **Zero-WDK Compilation**: Uses MSVC `lib.exe` (`ntoskrnl.def`) to link against `ntoskrnl.exe`
@@ -16,8 +15,8 @@
 //!    - Scans `\Registry\Machine\HARDWARE\DEVICEMAP\Scsi\Scsi Port 0..3\Scsi Bus 0..5\Target Id 0..1\Logical Unit Id 0`
 //!      at `DriverEntry` (`PASSIVE_LEVEL`) and overwrites `SerialNumber` in `DEVICEMAP\Scsi` via `ZwSetValueKey`.
 //! 4. **Multi-Stack Filter Attachment (`Harddisk0..7`, `RaidPort0..3`, `Spaceport`)**:
-//!    - Attaches Filter Device Objects (`FiDO`) to `\Device\Harddisk0\DR0`..`DR7`, `\Device\RaidPort0..3`,
-//!      and `\Device\Spaceport` (`Get-PhysicalDisk` / `MSFT_PhysicalDisk`).
+//!    - Attempts to attach Filter Device Objects (`FiDO`) to `\Device\Harddisk0\DR0`..`DR7`,
+//!      `\Device\RaidPort0..3`, and the `\Device\Spaceport` control device.
 //!    - Intercepts `IRP_MJ_DEVICE_CONTROL` completion for `IOCTL_STORAGE_QUERY_PROPERTY` (including
 //!      `StorageDeviceProperty` and `StorageDeviceUniqueIdProperty`),
 //!      `IOCTL_STORAGE_PROTOCOL_COMMAND`, `SMART_RCV_DRIVE_DATA`, `IOCTL_ATA_PASS_THROUGH`,
@@ -1155,7 +1154,7 @@ unsafe fn attach_all_storage_targets(driver_object: *mut DRIVER_OBJECT) {
         }
     }
 
-    // 3. `\Device\Spaceport` (Storage Spaces control device backing `Get-PhysicalDisk`)
+    // 3. `\Device\Spaceport` (Storage Spaces control device)
     const SPACEPORT_PATH: [u16; 18] = [
         b'\\' as u16, b'D' as u16, b'e' as u16, b'v' as u16, b'i' as u16, b'c' as u16,
         b'e' as u16, b'\\' as u16, b'S' as u16, b'p' as u16, b'a' as u16, b'c' as u16,
@@ -1193,7 +1192,7 @@ pub unsafe extern "system" fn DriverEntry(
             return STATUS_UNSUCCESSFUL;
         }
 
-        // 2. Capture factory serial from `HKLM\HARDWARE\DEVICEMAP\Scsi` and overwrite it in Registry
+        // 2. Update supported serial values in `HKLM\HARDWARE\DEVICEMAP\Scsi`.
         sync_devicemap_scsi_registry();
         sync_os_telemetry_guids_from_uuid();
 
