@@ -982,6 +982,9 @@ unsafe extern "system" fn on_ioctl_complete(
                 let sys_buf = (*irp).SystemBuffer as *mut u8;
                 if !sys_buf.is_null() {
                     let slice = core::slice::from_raw_parts_mut(sys_buf, valid_len);
+                    #[cfg(feature = "namespace-id-patch")]
+                    win_disk_patch::patch_ioctl_output_with_namespace_id(tag, slice, &serial);
+                    #[cfg(not(feature = "namespace-id-patch"))]
                     win_disk_patch::patch_ioctl_output_by_tag(tag, slice, &serial);
                 }
 
@@ -997,6 +1000,9 @@ unsafe extern "system" fn on_ioctl_complete(
                     let mdl_len = core::cmp::min(valid_len, (*mdl).ByteCount as usize);
                     let mdl_slice =
                         core::slice::from_raw_parts_mut((*mdl).MappedSystemVa as *mut u8, mdl_len);
+                    #[cfg(feature = "namespace-id-patch")]
+                    win_disk_patch::patch_ioctl_output_with_namespace_id(tag, mdl_slice, &serial);
+                    #[cfg(not(feature = "namespace-id-patch"))]
                     win_disk_patch::patch_ioctl_output_by_tag(tag, mdl_slice, &serial);
                 }
             }
