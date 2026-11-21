@@ -199,11 +199,11 @@ fn overwrite_preserving_spaces(target: &mut [u8], new_serial: &[u8; 20]) {
             *dst = new_serial[src_idx];
             src_idx += 1;
         } else {
-            // Wrap around non-space characters if target is longer than 20 bytes
-            let fallback = new_serial[0];
-            if fallback != b' ' {
-                *dst = fallback;
-            }
+            // If the Windows-reported serial field is longer than the
+            // controller serial, use ASCII space padding. Repeating the first
+            // byte used to create garbage suffixes like "CCCCCCCC" and must
+            // never happen. The stornvme NSID suffix is handled separately.
+            *dst = b' ';
         }
     }
 }
@@ -600,6 +600,27 @@ fn is_printable_ascii(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_long_registry_serial_pads_instead_of_repeating_first_char() {
+        // Regression: a 44-character Windows-reported identifier was rewritten
+        // with repeated leading serial bytes ("CCCC...") after source exhaustion.
+        let mut serial = *b"0000_0000_0000_0001_00A0_7523_453E_0948.";
+        let spoof = *b"CA54N299714909Q56   ";
+        assert!(patch_ascii_serial_slice(&mut serial, &spoof));
+        assert_eq!(&serial[..17], b"CA54N299714909Q56");
+        assert!(serial[17..].iter().all(|&b| b == b' '));
+    }
+
+    #[test]
+    fn test_long_registry_serial_preserves_namespace_suffix() {
+        let mut serial = *b"0000_0000_0000_0001_00A0_7523_453E_0948._00000001.";
+        let spoof = *b"CA54N299714909Q56   ";
+        assert!(patch_ascii_serial_slice(&mut serial, &spoof));
+        assert_eq!(&serial[..17], b"CA54N299714909Q56");
+        assert!(serial[17..serial.len() - 10].iter().all(|&b| b == b' '));
+        assert_eq!(&serial[serial.len() - 10..], b"_00000001.");
+    }
 
     #[test]
     fn test_patch_storage_device_descriptor_stornvme_format() {

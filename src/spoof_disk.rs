@@ -757,7 +757,11 @@ pub fn read_original_disks(
         let disk_info_ptr = &*disk_proto as *const EfiDiskInfoProtocol as *mut EfiDiskInfoProtocol;
         if let Some((_is_nvme, serial, model)) = unsafe { query_disk_hardware(disk_info_ptr) } {
             if disk_count == 0 {
-                first_serial.copy_from_slice(&serial);
+                // Some EFI_DISK_INFO_PROTOCOL implementations return garbage (";;")
+                // instead of a real controller serial. Do not show it as genuine.
+                if utils::is_plausible_disk_serial(&serial) {
+                    first_serial.copy_from_slice(&serial);
+                }
                 first_model.copy_from_slice(&model);
             }
             disk_count += 1;

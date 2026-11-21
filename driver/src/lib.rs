@@ -38,7 +38,8 @@ pub mod win_disk_patch;
 
 // ─── Global Spoofed & Original Disk Serial State ───────────────────────────
 
-static mut SPOOFED_DISK_SERIAL: [u8; 20] = *b"CA54N299714909Q56   ";
+// A missing/invalid v9 profile must not silently use a fixed fake serial.
+static mut SPOOFED_DISK_SERIAL: [u8; 20] = [b' '; 20];
 static mut SPOOFED_UUID_BYTES: [u8; 16] = [0u8; 16];
 static HAS_SPOOFED_UUID: AtomicBool = AtomicBool::new(false);
 static mut ORIG_DISK_SERIAL: [u8; 20] = [b' '; 20];
@@ -457,7 +458,21 @@ fn parse_v9_config_bytes(raw: &[u8]) -> bool {
     }
     let magic = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
     let version = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
-    if magic != SPOOF_CONFIG_MAGIC || version < 9 {
+    if magic != SPOOF_CONFIG_MAGIC || version != 9 {
+        return false;
+    }
+    // Match the packed SpoofConfig v9 additive checksum from persistence.rs.
+    let checksum_pos = SPOOF_CONFIG_V9_SIZE - 4;
+    let expected_checksum = u32::from_le_bytes([
+        raw[checksum_pos],
+        raw[checksum_pos + 1],
+        raw[checksum_pos + 2],
+        raw[checksum_pos + 3],
+    ]);
+    let actual_checksum = raw[..checksum_pos]
+        .iter()
+        .fold(0u32, |acc, &byte| acc.wrapping_add(byte as u32));
+    if expected_checksum != actual_checksum {
         return false;
     }
 
@@ -471,7 +486,7 @@ fn parse_v9_config_bytes(raw: &[u8]) -> bool {
         }
         if (0x20..=0x7E).contains(&ch) {
             *slot = ch as u8;
-            if ch as u8 != b' ' {
+            if (ch as u8).is_ascii_alphanumeric() {
                 non_space += 1;
             }
         }
@@ -504,7 +519,7 @@ fn parse_v9_config_bytes(raw: &[u8]) -> bool {
     true
 }
 
-unsafe fn load_spoof_config_from_uefi_or_esp() {
+unsafe fn load_spoof_config_from_uefi_or_esp() -> bool {
     let mut raw_buf = [0u8; 1728];
 
     // 1. Try UEFI Runtime Variable `SmbiosSpoof`
@@ -528,8 +543,11 @@ unsafe fn load_spoof_config_from_uefi_or_esp() {
             ptr::null_mut(),
         )
     };
-    if status >= 0 && parse_v9_config_bytes(&raw_buf[..val_len as usize]) {
-        return;
+    if status >= 0
+        && (val_len as usize) <= raw_buf.len()
+        && parse_v9_config_bytes(&raw_buf[..val_len as usize])
+    {
+        return true;
     }
 
     // 2. Fallback: Try reading `\Device\HarddiskVolume1..8\EFI\SmbiosSpoofer\uuid.dat`
@@ -600,12 +618,14 @@ unsafe fn load_spoof_config_from_uefi_or_esp() {
             }
             if read_status >= 0
                 && iosb.Information >= SPOOF_CONFIG_V9_SIZE
-                && parse_v9_config_bytes(&raw_buf[..iosb.Information])
+                && (iosb.Information as usize) <= raw_buf.len()
+                && parse_v9_config_bytes(&raw_buf[..iosb.Information as usize])
             {
-                return;
+                return true;
             }
         }
     }
+    false
 }
 
 /// Scans `\Registry\Machine\HARDWARE\DEVICEMAP\Scsi\Scsi Port P\Scsi Bus B\Target Id T\Logical Unit Id 0`
@@ -1215,7 +1235,10 @@ pub unsafe extern "system" fn DriverEntry(
         let _ = ptr::read_volatile(&raw const RELOC_ANCHOR);
 
         // 1. Load spoofed disk serial from UEFI NVRAM (`SmbiosSpoof` v9) or ESP `uuid.dat`
-        load_spoof_config_from_uefi_or_esp();
+        if !load_spoof_config_from_uefi_or_esp() {
+            // Fail closed rather than report a hardcoded serial as an active spoof.
+            return STATUS_UNSUCCESSFUL;
+        }
 
         // 2. Capture factory serial from `HKLM\HARDWARE\DEVICEMAP\Scsi` and overwrite it in Registry
         sync_devicemap_scsi_registry();
