@@ -54,7 +54,7 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
-          foreach ($name in @("attachment", "spaceport_candidate", "spaceport_serial_patch", "namespace_id_patch")) {
+          foreach ($name in @("attachment", "spaceport_candidate", "spaceport_serial_patch", "namespace_id_patch", "namespace_id_diagnostics")) {
             $path = if ($name -eq "namespace_id_patch") { "src/namespace_id_patch.rs" } else { "driver/src/$name.rs" }
             $exe = "$env:TEMP/$name-ci-tests.exe"
             rustc --edition=2024 --test $path -o $exe
