@@ -26,6 +26,7 @@ echo     [9] Full uninstall: remove service and UEFI boot entry
 echo     [10] Complete install with MAC spoofing
 echo     [11] Complete headless install with MAC spoofing
 echo.
+set "CHOICE="
 set /p CHOICE="  Select [1-11, Enter=1]: "
 if "%CHOICE%"=="" set "CHOICE=1"
 
