@@ -466,47 +466,80 @@ function Install-WindowsDiskFilterDriver {
         Write-Ok "Windows Test-Signing mode is already active."
     }
 
-    # 2. Self-sign smbios-disk-filter.sys with a trusted local code-signing certificate
-    try {
-        $certSubject = "CN=SmbiosSpooferKernelCert"
-        $cert = Get-ChildItem Cert:\LocalMachine\My -CodeSigningCert -ErrorAction SilentlyContinue |
-            Where-Object { $_.Subject -eq $certSubject } |
-            Select-Object -First 1
-
-        if (-not $cert) {
-            $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject $certSubject `
-                -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 `
-                -CertStoreLocation "Cert:\LocalMachine\My" -NotAfter (Get-Date).AddYears(10)
+    # 2. Validate CNG private key by actually signing test data (HasPrivateKey alone is insufficient).
+    function Test-CodeSigningKey($candidate) {
+        $rsa = $null
+        try {
+            $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($candidate)
+            if ($null -eq $rsa) { return $false }
+            $proof = $rsa.SignData([byte[]](1,2,3,4), [System.Security.Cryptography.HashAlgorithmName]::SHA256, [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
+            return ($proof.Length -gt 0)
+        } catch {
+            return $false
+        } finally {
+            if ($null -ne $rsa) { $rsa.Dispose() }
         }
+    }
 
-        foreach ($storeName in @("Root", "TrustedPublisher")) {
-            $store = New-Object System.Security.Cryptography.X509Certificates.X509Store($storeName, "LocalMachine")
+    $certSubject = "CN=SmbiosSpooferKernelCert"
+    $cert = $null
+    $candidates = @(Get-ChildItem Cert:\LocalMachine\My -CodeSigningCert -ErrorAction SilentlyContinue | Where-Object { $_.Subject -eq $certSubject } | Sort-Object NotBefore -Descending)
+    foreach ($candidate in $candidates) {
+        if (Test-CodeSigningKey $candidate) {
+            $cert = $candidate
+            break
+        }
+        Write-Warn "Ignoring certificate $($candidate.Thumbprint): private key is unusable or missing."
+    }
+    if (-not $cert) {
+        Write-Step "Creating a new code-signing certificate (no usable existing key found)..."
+        $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject $certSubject -Provider "Microsoft Software Key Storage Provider" -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 -CertStoreLocation "Cert:\LocalMachine\My" -NotAfter (Get-Date).AddYears(10) -ErrorAction Stop
+        if (-not (Test-CodeSigningKey $cert)) {
+            throw "New signing certificate has no working private key; refusing to install."
+        }
+    }
+
+    foreach ($storeName in @("Root", "TrustedPublisher")) {
+        $store = New-Object System.Security.Cryptography.X509Certificates.X509Store($storeName, "LocalMachine")
+        try {
             $store.Open("ReadWrite")
             if (-not ($store.Certificates | Where-Object { $_.Thumbprint -eq $cert.Thumbprint })) {
                 $store.Add($cert)
             }
+        } finally {
             $store.Close()
         }
+    }
 
-        Copy-Item -Path $LocalDriverCopy -Destination $SystemDriverPath -Force
-        $sig = Set-AuthenticodeSignature -FilePath $SystemDriverPath -Certificate $cert -HashAlgorithm SHA256
-        Write-Ok "Signed and deployed kernel filter: $SystemDriverPath ($($sig.Status))"
-    } catch {
-        Stop-Service -Name $DriverServiceName -Force -ErrorAction SilentlyContinue
-        try {
-            Copy-Item -Path $LocalDriverCopy -Destination $SystemDriverPath -Force
-            Write-Warn "Deployed $SystemDriverPath (Authenticode signing note: $($_.Exception.Message))"
-        } catch {
-            # If the running driver image is locked in memory until reboot, stage via pending rename or temp swap
-            $oldDriverTmp = "$SystemDriverPath.old"
-            Remove-Item -Path $oldDriverTmp -Force -ErrorAction SilentlyContinue
-            Rename-Item -Path $SystemDriverPath -NewName "smbios-disk-filter.sys.old" -Force -ErrorAction SilentlyContinue
-            Copy-Item -Path $LocalDriverCopy -Destination $SystemDriverPath -Force
-            if ($cert) {
-                $sig = Set-AuthenticodeSignature -FilePath $SystemDriverPath -Certificate $cert -HashAlgorithm SHA256
-                Write-Ok "Replaced in-use kernel filter on disk: $SystemDriverPath ($($sig.Status))"
+    # Sign a staged copy, verify, then deploy; never install unsigned files as fallback.
+    $stagedDriver = Join-Path $env:TEMP ("smbios-disk-filter-" + [guid]::NewGuid().ToString("N") + ".sys")
+    try {
+        Copy-Item -Path $LocalDriverCopy -Destination $stagedDriver -Force -ErrorAction Stop
+        $signTool = Get-Command signtool.exe -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source
+        if (-not $signTool) {
+            $sdkRoot = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) "Windows Kits\10\bin"
+            if (Test-Path $sdkRoot) {
+                $signTool = Get-ChildItem $sdkRoot -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
             }
         }
+        if (-not $signTool) { throw "Windows SDK signtool.exe (x64) not found." }
+
+        & $signTool sign /v /fd SHA256 /s My /sm /sha1 $cert.Thumbprint $stagedDriver
+        if ($LASTEXITCODE -ne 0) {
+            throw "SignTool failed to sign staged driver (exit code $LASTEXITCODE)."
+        }
+        $check = Get-AuthenticodeSignature -FilePath $stagedDriver
+        if ($check.Status -ne "Valid") {
+            throw "Driver signature verification failed: $($check.Status). Refusing to deploy."
+        }
+        Copy-Item -Path $stagedDriver -Destination $SystemDriverPath -Force -ErrorAction Stop
+        $installedSig = Get-AuthenticodeSignature -FilePath $SystemDriverPath
+        if ($installedSig.Status -ne "Valid") {
+            throw "Installed driver failed signature verification: $($installedSig.Status)."
+        }
+        Write-Ok "Signed and verified kernel filter: $SystemDriverPath ($($cert.Thumbprint))"
+    } finally {
+        Remove-Item -Path $stagedDriver -Force -ErrorAction SilentlyContinue
     }
 
     # 3. Register standalone kernel service (start= system, safe: never causes 0x7B if blocked)
