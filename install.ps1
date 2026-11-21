@@ -253,7 +253,7 @@ function Ensure-RustToolchain {
 function Invoke-DriverBuild {
     Ensure-RustToolchain
     if (-not $SkipTests) {
-        foreach ($module in @("attachment", "spaceport_candidate", "spaceport_serial_patch")) {
+        foreach ($module in @("attachment", "spaceport_candidate", "spaceport_serial_patch", "namespace_id_patch")) {
             $testSource = Join-Path $ProjectRoot "driver\src\$module.rs"
             $testExe = Join-Path $env:TEMP ("smbios-" + $module + "-" + [guid]::NewGuid().ToString("N") + ".exe")
             try {
