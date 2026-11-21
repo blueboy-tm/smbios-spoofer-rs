@@ -317,3 +317,55 @@ would see only requests reaching its attached stacks and could still miss the
 assignment. This workflow requires neither a filter change nor a restart.
 
 [MSFT_PhysicalDisk](https://learn.microsoft.com/en-us/windows-hardware/drivers/storage/msft-physicaldisk) · [StorNVMe translation](https://learn.microsoft.com/en-us/windows-hardware/drivers/storage/stornvme-scsi-translation-support) · [Logman trace options](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/logman-create-trace)
+
+### Inspect a candidate Spaceport detailed-drive response offline
+
+The supplied investigation links the observed property to MISpace and its
+input record. It suggests that IOCTL `0x00E70408` on Spaceport returns that
+record. Neither the provider consumer nor the candidate kernel routine
+establishes the response layout by itself.
+
+The `storage_query::spaceport::candidate_serial_matches` library function
+tests exactly one interpretation of a previously captured output. It checks
+that capture metadata identifies a successful Spaceport request with that
+code, and that the completed length fits both the caller's output capacity
+and the available capture. It interprets bytes at `0xA3C` as a little-endian
+32-bit byte offset from the start of output, requiring an even offset past
+the field. It compares a bounded, NUL-terminated UTF-16LE candidate with
+separately observed text. It returns only a match or a structural error.
+These rules describe the tested hypothesis and synthetic fixtures. A match
+does not authenticate the caller-supplied metadata, identify a physical disk,
+or establish how much memory belongs exclusively to the string.
+
+For Windows verification, run the existing read-only PhysicalDisk ETW
+workflow above on the affected boot to look for a correlated request. If it
+does not expose response bytes and request identity, use an authorized
+debugger capture of the provider's **existing** request and returned buffer.
+Do not issue the undocumented IOCTL as part of this procedure. Record the OS,
+Spaceport and MISpace versions, the handle target, request parameters, status,
+returned length and output capacity. Keep the bytes local. Feed copies into
+the offline checker with the observed grouped serial as the expected text.
+A second disk with a distinct identity is needed to show that the same rule
+selects its corresponding record. Compare the namespace ID before and after
+the read-only observation exactly, including punctuation.
+
+Before a handler could write anything, the provider-side evidence needs to
+show which base and units the consumer adds to the field, what bounds the
+record and its strings, which versions support that interpretation, whether
+fields share storage, and how to identify the selected disk independently of
+its serial. A terminator does not establish writable capacity. Test evidence
+for short output and incomplete enumeration is also needed. The current
+offline checker returns no writable region and adds no kernel request tag.
+
+The driver stores a per-attachment disk index. Spaceport and RaidPort use
+index zero, so the index alone cannot identify Spaceport or PhysicalDrive0.
+The IOCTL's low method bits encode METHOD_BUFFERED. A future route for this
+request would need an explicit Spaceport attachment kind and a SystemBuffer
+view bounded by the completed length and output capacity, with no MDL
+fallback. Kernel completion work would need to be nonpageable and safe at
+DISPATCH_LEVEL, preserve pending propagation, and participate in reliable
+unload rundown. The existing unload path stops spinning after a fixed bound
+even if its completion count is nonzero. This diagnostic does not add any
+completion work.
+
+[Windows IOCTL buffer methods](https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/buffer-descriptions-for-i-o-control-codes)
