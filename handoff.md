@@ -28,13 +28,13 @@
    - Attache des Filter Device Objects (`FiDO`) sur :
      - `\Device\Harddisk0\DR0` .. `\Device\Harddisk7\DR7` (`Win32_DiskDrive`, `MSFT_Disk` / `Get-Disk`, `DeviceIoControl`)
      - `\Device\RaidPort0` .. `\Device\RaidPort3` (`\\.\Scsi0:`)
-     - `\Device\Spaceport` (`Get-PhysicalDisk` / Storage Spaces)
+     - `\Device\Spaceport` (périphérique de contrôle Storage Spaces, si disponible)
    - Intercepte `IRP_MJ_DEVICE_CONTROL` avec completion routine (`IoSetCompletionRoutine`) sur :
      - `IOCTL_STORAGE_QUERY_PROPERTY` (`0x002D1400`) : `StorageDeviceProperty (0)` et `StorageDeviceUniqueIdProperty (3)`
      - `IOCTL_STORAGE_PROTOCOL_COMMAND` (`0x002DD380`) & `IOCTL_SCSI_MINIPORT` (`0x0004D008`) : NVMe Identify Controller (`4096B`, bytes `4..23`)
      - `SMART_RCV_DRIVE_DATA` (`0x0007C088`) & `IOCTL_ATA_PASS_THROUGH` (`0x0004D02C`) : ATA Identify word-swapped (`words 10..19`)
-     - `IOCTL_SCSI_PASS_THROUGH` (`0x0004D004`) & `IOCTL_SCSI_PASS_THROUGH_DIRECT` (`0x0004D014`) : SCSI VPD `0x80` (Unit Serial) et `0x83` (Device Identification)
-   - Préservation du suffixe Namespace ID (`_00000001.`) de `stornvme.sys` sur les numéros de série NVMe de 30 octets (`YF0W826954803M86Y   _00000001.`) et sur les descripteurs VPD `0x83` de 68 octets (`offset 48..68`).
+     - `IOCTL_SCSI_PASS_THROUGH` (`0x0004D004`) : SCSI VPD `0x80` (Unit Serial)
+   - Préservation du suffixe Namespace ID (`_00000001.`) de `stornvme.sys` sur les numéros de série NVMe (`YF0W826954803M86Y   _00000001.`). Les descripteurs VPD `0x83` (Device Identification) sont transmis sans modification.
    - Synchronisation automatique en Ring 0 (`DriverEntry`) et via [`install.ps1`](file:///C:/Users/rapha/Documents/Projets/smbios/smbios-spoofer-rs/install.ps1) de :
      - `HKLM\HARDWARE\DEVICEMAP\Scsi\Scsi Port X\...\Logical Unit Id 0\SerialNumber`
      - `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid`
@@ -62,8 +62,12 @@
 - **Secure Boot & Test Signing** :
   - L'exécution de `smbios-spoofer.efi` (non signé Microsoft UEFI CA) requiert **Secure Boot = Disabled** dans le BIOS.
   - Le chargement du driver noyau `smbios-disk-filter.sys` signé avec un certificat local requiert **`bcdedit /set testsigning on`**.
-- **WMI `MSFT_PhysicalDisk` (Storage Spaces Cache)** :
-  - Le service `Spaceport` met parfois en cache le `SerialNumber` de la structure interne `SPACES_PhysicalDisk` très tôt au boot (`BOOT_START`) avant `SYSTEM_START`. En revanche, `Win32_DiskDrive`, `Get-Disk` (`MSFT_Disk`), `DeviceIoControl` direct sur `\\.\PhysicalDrive0` et `HKLM\HARDWARE\DEVICEMAP\Scsi` retournent tous la valeur spoofée `YF0W826954803M86Y   _00000001.`.
+- **Numéros de série Windows et identifiants de namespace NVMe**
+  - `Win32_DiskDrive.SerialNumber` est associé au champ `SerialNumberOffset` de `STORAGE_DEVICE_DESCRIPTOR`. `Get-PhysicalDisk` expose les valeurs `MSFT_PhysicalDisk` des fournisseurs de gestion du stockage. Microsoft associe ce numéro de série aux données SCSI Inquiry. [Win32_DiskDrive](https://learn.microsoft.com/en-us/windows/win32/cimwin32prov/win32-diskdrive) · [Get-PhysicalDisk](https://learn.microsoft.com/en-us/powershell/module/storage/get-physicaldisk) · [MSFT_StorageFaultDomain](https://learn.microsoft.com/en-us/windows-hardware/drivers/storage/msft-storagefaultdomain)
+  - Sur le Micron 2400, `0000_0000_0000_0001_00A0_7523_453E_0948.` et `eui.000000000000000100A07523453E0948` encodent les mêmes 32 chiffres hexadécimaux. Cette correspondance suggère une origine commune, mais la forme groupée peut aussi occuper le champ `SerialNumberOffset`. Le test de régression vérifie que ce champ série continue de produire `XKNVHETV1TXQNT3` dans ce cas. Les réponses VPD `0x83`, les identifiants EUI-64 et NGUID, les chaînes `eui.` et les réponses opaques restent préservés.
+  - Le filtre tente ses attachements aux chemins nommés dans `DriverEntry`. Le démarrage réussi du service indique que `DriverEntry` a terminé avec succès. Les résultats des tentatives d’attachement ne sont pas remontés au service. La routine de complétion ne traite que les requêtes `IRP_MJ_DEVICE_CONTROL` classées qui traversent un filtre attaché. Le chemin réel du fournisseur, la présence d’un cache et son éventuelle date de remplissage restent à vérifier sur le système concerné.
+  - Pour isoler la provenance en lecture seule, relever séparément `DeviceID`, `PNPDeviceID`, `Model` et `SerialNumber` de `Win32_DiskDrive`, puis `ObjectId`, `PhysicalLocation`, `SerialNumber`, `UniqueId` et `UniqueIdFormat` via `Get-PhysicalDisk`. Corréler les disques par modèle et emplacement. L’identifiant du fournisseur peut désigner un objet différent d’un numéro `PhysicalDriveN`.
+  - Sur le chemin `DeviceID` de `Win32_DiskDrive`, comparer les réponses de `IOCTL_STORAGE_QUERY_PROPERTY` pour `StorageDeviceProperty` (champ `SerialNumberOffset`) et `StorageDeviceIdProperty` (VPD `0x83`) aux valeurs collectées. Cette lecture directe donne le résultat du chemin disque. Pour examiner celui du fournisseur, isoler un appel `Get-PhysicalDisk` dans une trace WMI/ETW, puis corréler son activité fournisseur avec les événements d’E/S disponibles (horodatage, processus, cible, code de contrôle et pile). En l’absence d’une requête observable, le cache reste une hypothèse. Le pilote, le cache et la configuration de démarrage restent en l’état pendant cette collecte. [Traçage WMI](https://learn.microsoft.com/en-us/windows/win32/wmisdk/tracing-wmi-activity)
 
 ---
 

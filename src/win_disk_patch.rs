@@ -645,6 +645,29 @@ mod tests {
     }
 
     #[test]
+    fn test_storage_device_descriptor_patches_micron_grouped_serial() {
+        const SERIAL_OFFSET: usize = 40;
+        const ORIGINAL_SERIAL: &[u8] = b"0000_0000_0000_0001_00A0_7523_453E_0948.\0";
+        let mut buf = [0u8; SERIAL_OFFSET + ORIGINAL_SERIAL.len()];
+        let size = buf.len() as u32;
+        buf[..4].copy_from_slice(&40u32.to_le_bytes());
+        buf[4..8].copy_from_slice(&size.to_le_bytes());
+        buf[24..28].copy_from_slice(&(SERIAL_OFFSET as u32).to_le_bytes());
+        buf[SERIAL_OFFSET..].copy_from_slice(ORIGINAL_SERIAL);
+
+        // StorageDeviceProperty uses SerialNumberOffset even for a namespace-shaped value.
+        let tag = classify_ioctl_request(IOCTL_STORAGE_QUERY_PROPERTY, &[0; 8]);
+        assert_eq!(tag, TAG_STORAGE_DEVICE_DESCRIPTOR);
+        let serial = b"XKNVHETV1TXQNT3     ";
+        let mut expected = buf;
+        expected[SERIAL_OFFSET..buf.len() - 1].fill(b' ');
+        expected[SERIAL_OFFSET..SERIAL_OFFSET + serial.len()].copy_from_slice(serial);
+
+        assert!(patch_ioctl_output_by_tag(tag, &mut buf, serial));
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
     fn test_patch_storage_protocol_descriptor_nvme_identify() {
         // 48-byte header + 4096-byte NVMe Identify Controller payload
         let mut buf = [0u8; 48 + 4096];
