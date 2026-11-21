@@ -48,6 +48,13 @@ impl Record {
     }
 }
 
+/// Return true only for an existing Spaceport detailed-drive request with
+/// nonzero caller output capacity. No buffer contents are inspected.
+#[cfg(any(feature = "attachment-diagnostics", test))]
+pub fn should_count_spaceport(is_spaceport: bool, ioctl: u32, output_capacity: usize) -> bool {
+    is_spaceport && ioctl == 0x00E7_0408 && output_capacity != 0
+}
+
 /// Debugger-readable counters for the *existing* Spaceport detailed-drive IOCTL.
 /// These counters never inspect an input or output buffer.
 #[cfg(any(feature = "attachment-diagnostics", test))]
@@ -92,6 +99,14 @@ impl SpaceportIoctlCounters {
 mod tests {
     use super::*;
     use core::sync::atomic::Ordering;
+
+    #[test]
+    fn only_expected_spaceport_requests_are_counted() {
+        assert!(should_count_spaceport(true, 0x00E7_0408, 8192));
+        assert!(!should_count_spaceport(false, 0x00E7_0408, 8192));
+        assert!(!should_count_spaceport(true, 0x00E7_0404, 8192));
+        assert!(!should_count_spaceport(true, 0x00E7_0408, 0));
+    }
 
     #[test]
     fn spaceport_counters_have_fixed_debugger_layout() {
