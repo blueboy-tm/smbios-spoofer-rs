@@ -13,7 +13,7 @@ foreach ($file in $files) {
     [System.Management.Automation.Language.Parser]::ParseFile(
         $file, [ref]$tokens, [ref]$parseErrors
     ) | Out-Null
-    if (@($parseErrors).Count -gt 0) {
+    if ($null -ne $parseErrors -and $parseErrors.Count -gt 0) {
         foreach ($err in $parseErrors) {
             $failures += "$file : $($err.Extent.StartLineNumber) : $($err.Message)"
         }
