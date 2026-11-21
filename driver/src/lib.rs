@@ -42,7 +42,6 @@ static SmbiosSpaceportIoctlSnapshot: attachment::SpaceportIoctlCounters =
 
 #[cfg(feature = "attachment-diagnostics")]
 const SPACEPORT_DRIVE_INFO_IOCTL: u32 = 0x00E7_0408;
-#[cfg(feature = "attachment-diagnostics")]
 const TAG_SPACEPORT_DIAGNOSTIC: u8 = 0xFE;
 
 #[cfg(feature = "attachment-diagnostics")]
@@ -914,12 +913,7 @@ unsafe extern "system" fn on_ioctl_complete(
             SmbiosSpaceportIoctlSnapshot.on_completion(status, info_len);
         }
 
-        if status >= 0 && info_len > 0 && tag != {
-            #[cfg(feature = "attachment-diagnostics")]
-            { TAG_SPACEPORT_DIAGNOSTIC }
-            #[cfg(not(feature = "attachment-diagnostics"))]
-            { win_disk_patch::TAG_NONE }
-        } {
+        if status >= 0 && info_len > 0 && tag != TAG_SPACEPORT_DIAGNOSTIC {
             let out_buf_cap = packed & 0xFFFF_FFFF;
             let disk_idx = ((packed >> 40) & 0xFF) as u8;
 
@@ -995,12 +989,14 @@ unsafe extern "system" fn dispatch_device_control(
                 &[]
             };
 
-            let mut tag = win_disk_patch::classify_ioctl_request(ioctl, input_slice);
+            let tag = win_disk_patch::classify_ioctl_request(ioctl, input_slice);
             #[cfg(feature = "attachment-diagnostics")]
-            if (*ext).is_spaceport != 0 && ioctl == SPACEPORT_DRIVE_INFO_IOCTL {
+            let tag = if (*ext).is_spaceport != 0 && ioctl == SPACEPORT_DRIVE_INFO_IOCTL {
                 // Observe this request only. Never access or rewrite its buffer.
-                tag = TAG_SPACEPORT_DIAGNOSTIC;
-            }
+                TAG_SPACEPORT_DIAGNOSTIC
+            } else {
+                tag
+            };
             if tag != win_disk_patch::TAG_NONE && out_len > 0 {
                 #[cfg(feature = "attachment-diagnostics")]
                 if tag == TAG_SPACEPORT_DIAGNOSTIC {
