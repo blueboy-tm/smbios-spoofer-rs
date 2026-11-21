@@ -1,5 +1,7 @@
 #[cfg(any(windows, test))]
 mod descriptor;
+#[cfg(any(windows, test))]
+mod vpd80;
 #[cfg(windows)]
 mod windows;
 

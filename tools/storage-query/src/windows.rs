@@ -1,4 +1,5 @@
 use crate::descriptor::{self, Identifier, LayoutSignature, ParseResult};
+use crate::vpd80::{self, Inquiry, ReplyError};
 use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -8,6 +9,7 @@ use std::ptr;
 
 const PATH: &str = r"\\.\PhysicalDrive0";
 const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002D_1400;
+const IOCTL_SCSI_PASS_THROUGH: u32 = 0x0004_D004;
 const FILE_SHARE_READ: u32 = 1;
 const FILE_SHARE_WRITE: u32 = 2;
 const MAX_REPLY_BYTES: usize = 1024 * 1024;
@@ -27,6 +29,21 @@ extern "system" {
 }
 
 pub fn run() -> ExitCode {
+    let mut args = std::env::args_os().skip(1);
+    let with_vpd80 = match args.next() {
+        None => false,
+        Some(arg) if arg == "--vpd80" && args.next().is_none() => true,
+        Some(arg) if arg == "--help" && args.next().is_none() => {
+            println!("Usage: storage-query [--vpd80]");
+            println!("--vpd80 adds a data-in SCSI INQUIRY using the read/write handle required by Windows.");
+            return ExitCode::SUCCESS;
+        }
+        _ => {
+            eprintln!("Usage: storage-query [--vpd80]");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Zero desired access allows metadata queries without read or write data access.
     let disk = match OpenOptions::new()
         .access_mode(0)
@@ -68,11 +85,74 @@ pub fn run() -> ExitCode {
         }
     }
 
+    if with_vpd80 {
+        println!("\nOptional SCSI INQUIRY EVPD page 0x80");
+        if let Err(reason) = probe_vpd80() {
+            println!("  Probe unavailable: {reason}");
+        }
+    }
+
     if any_decoded {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
     }
+}
+
+fn probe_vpd80() -> Result<(), String> {
+    // Windows requires a read/write handle for SCSI pass-through, even with a
+    // data-in CDB. Only the fixed inquiry packet below is sent on this path.
+    let disk = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(PATH)
+        .map_err(|error| {
+            format!("Windows did not grant the handle required for pass-through: {error}")
+        })?;
+
+    // STORAGE_ADAPTER_DESCRIPTOR supplies the required DataBufferOffset alignment.
+    let adapter =
+        query(&disk, 1).map_err(|error| format!("adapter property query failed: {error}"))?;
+    let header = adapter
+        .first_chunk::<20>()
+        .ok_or("truncated adapter descriptor")?;
+    let size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+    if !(header.len()..=adapter.len()).contains(&size) {
+        return Err("invalid adapter descriptor size".into());
+    }
+    let alignment_mask = u32::from_le_bytes([header[16], header[17], header[18], header[19]]);
+    let mut inquiry = Inquiry::new(alignment_mask)?;
+    let mut returned = 0;
+    let buffer = inquiry.buffer.as_mut_ptr().cast();
+    // SAFETY: METHOD_BUFFERED supports a shared input/output buffer. Its input is
+    // the initialized header and CDB, and the output length covers the allocation.
+    // The owning handle and buffer remain live for this synchronous call.
+    let ok = unsafe {
+        DeviceIoControl(
+            disk.as_raw_handle(),
+            IOCTL_SCSI_PASS_THROUGH,
+            buffer,
+            vpd80::HEADER_SIZE as u32,
+            buffer,
+            inquiry.buffer.len() as u32,
+            &mut returned,
+            ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    let raw = inquiry
+        .reply(returned as usize)
+        .map_err(|error| match error {
+            ReplyError::Invalid(reason) => reason.to_owned(),
+            ReplyError::ScsiStatus(status) => format!("device returned SCSI status 0x{status:02X}"),
+        })?;
+    println!("  Returned data ({} bytes, hex): {}", raw.len(), hex(raw));
+    let serial = vpd80::serial(raw)?;
+    println!("  VPD serial: \"{}\"", serial.escape_ascii());
+    Ok(())
 }
 
 fn query(disk: &File, property: u32) -> io::Result<Vec<u8>> {
