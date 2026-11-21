@@ -24,3 +24,7 @@ strip = false
 attachment-diagnostics = []
 # Experimental; only for the observed Micron 2400 response with exact old string.
 spaceport-serial-patch = ["attachment-diagnostics"]
+
+# Optional exact-match Micron StorageDeviceIdProperty/DUID SCSI-name-string alias.
+# Does NOT rewrite actual NVMe EUI-64/NGUID or Spaceport UniqueId.
+namespace-id-patch = []
