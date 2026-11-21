@@ -36,6 +36,13 @@ static SmbiosAttachmentSnapshot: [attachment::Record; 13] =
     [const { attachment::Record::empty() }; 13];
 
 #[cfg(feature = "attachment-diagnostics")]
+#[unsafe(no_mangle)]
+static SmbiosSpaceportIoctlSnapshot: attachment::SpaceportIoctlCounters =
+    attachment::SpaceportIoctlCounters::empty();
+
+const TAG_SPACEPORT_DIAGNOSTIC: u8 = 0xFE;
+
+#[cfg(feature = "attachment-diagnostics")]
 fn record_attachment(index: usize, outcome: Outcome) {
     unsafe extern "system" {
         fn KeQueryInterruptTimePrecise(qpc: *mut u64) -> u64;
@@ -316,6 +323,8 @@ const _: () = {
 struct FilterExtension {
     lower_device: *mut DEVICE_OBJECT,
     disk_index: u32,
+    // Explicit attachment identity. disk_index=0 is shared by other targets.
+    is_spaceport: u32,
 }
 
 // ─── `ntoskrnl.exe` Imports ────────────────────────────────────────────────
@@ -894,11 +903,16 @@ unsafe extern "system" fn on_ioctl_complete(
 
         let status = (*irp).IoStatus.Status;
         let info_len = (*irp).IoStatus.Information;
+        let packed = context as usize;
+        let tag = ((packed >> 32) & 0xFF) as u8;
 
-        if status >= 0 && info_len > 0 {
-            let packed = context as usize;
+        #[cfg(feature = "attachment-diagnostics")]
+        if tag == TAG_SPACEPORT_DIAGNOSTIC {
+            SmbiosSpaceportIoctlSnapshot.on_completion(status, info_len);
+        }
+
+        if status >= 0 && info_len > 0 && tag != TAG_SPACEPORT_DIAGNOSTIC {
             let out_buf_cap = packed & 0xFFFF_FFFF;
-            let tag = ((packed >> 32) & 0xFF) as u8;
             let disk_idx = ((packed >> 40) & 0xFF) as u8;
 
             let valid_len = core::cmp::min(info_len, out_buf_cap);
@@ -974,7 +988,22 @@ unsafe extern "system" fn dispatch_device_control(
             };
 
             let tag = win_disk_patch::classify_ioctl_request(ioctl, input_slice);
+            #[cfg(feature = "attachment-diagnostics")]
+            let tag = if attachment::should_count_spaceport(
+                (*ext).is_spaceport != 0,
+                ioctl,
+                out_len,
+            ) {
+                // Observe this request only. Never access or rewrite its buffer.
+                TAG_SPACEPORT_DIAGNOSTIC
+            } else {
+                tag
+            };
             if tag != win_disk_patch::TAG_NONE && out_len > 0 {
+                #[cfg(feature = "attachment-diagnostics")]
+                if tag == TAG_SPACEPORT_DIAGNOSTIC {
+                    SmbiosSpaceportIoctlSnapshot.on_request();
+                }
                 ACTIVE_IRPS.fetch_add(1, Ordering::AcqRel);
                 let packed_ctx = ((disk_idx << 40)
                     | ((tag as usize) << 32)
@@ -1058,6 +1087,7 @@ unsafe fn attach_single_device_path(
     driver_object: *mut DRIVER_OBJECT,
     ustr: &UNICODE_STRING,
     disk_index: u32,
+    is_spaceport: bool,
 ) -> Outcome {
     let slot = ATTACHED_COUNT.load(Ordering::Relaxed);
     if slot >= MAX_ATTACHED_FIDOS {
@@ -1098,6 +1128,7 @@ unsafe fn attach_single_device_path(
             let ext = (*filter_device).DeviceExtension as *mut FilterExtension;
             (*ext).lower_device = ptr::null_mut();
             (*ext).disk_index = disk_index;
+            (*ext).is_spaceport = u32::from(is_spaceport);
 
             (*filter_device).Flags |=
                 (*target_device).Flags & (DO_BUFFERED_IO | DO_DIRECT_IO | DO_POWER_PAGABLE);
@@ -1150,7 +1181,7 @@ unsafe fn attach_all_storage_targets(driver_object: *mut DRIVER_OBJECT) {
             Buffer: hd_path.as_ptr(),
         };
         unsafe {
-            let _outcome = attach_single_device_path(driver_object, &ustr, idx);
+            let _outcome = attach_single_device_path(driver_object, &ustr, idx, false);
             #[cfg(feature = "attachment-diagnostics")]
             record_attachment(idx as usize, _outcome);
         }
@@ -1173,7 +1204,7 @@ unsafe fn attach_all_storage_targets(driver_object: *mut DRIVER_OBJECT) {
             Buffer: rp_path.as_ptr(),
         };
         unsafe {
-            let _outcome = attach_single_device_path(driver_object, &ustr, 0);
+            let _outcome = attach_single_device_path(driver_object, &ustr, 0, false);
             #[cfg(feature = "attachment-diagnostics")]
             record_attachment(8 + idx as usize, _outcome);
         }
@@ -1192,7 +1223,7 @@ unsafe fn attach_all_storage_targets(driver_object: *mut DRIVER_OBJECT) {
         Buffer: SPACEPORT_PATH.as_ptr(),
     };
     unsafe {
-        let _outcome = attach_single_device_path(driver_object, &sp_ustr, 0);
+        let _outcome = attach_single_device_path(driver_object, &sp_ustr, 0, true);
         #[cfg(feature = "attachment-diagnostics")]
         record_attachment(12, _outcome);
     }

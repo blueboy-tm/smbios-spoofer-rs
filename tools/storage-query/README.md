@@ -369,3 +369,48 @@ even if its completion count is nonzero. This diagnostic does not add any
 completion work.
 
 [Windows IOCTL buffer methods](https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/buffer-descriptions-for-i-o-control-codes)
+
+
+### Opt-in Spaceport detailed-drive IOCTL counters (kernel debugger)
+
+Build the Windows filter with `--features attachment-diagnostics` to enable a
+fixed, debugger-readable `SmbiosSpaceportIoctlSnapshot` alongside the existing
+13-row attachment snapshot. The normal driver build omits these counters.
+This opt-in code registers a completion for an *existing* `0x00E70408`
+request only when the request reaches the explicitly marked
+`\\Device\\Spaceport` filter attachment **and the caller provides a nonzero
+output capacity**. It never reads or changes input/output contents or any
+hardware identifier, and it does not issue IOCTLs of its own.
+
+In a live kernel debugging session on the affected boot, after confirming the
+filter's Spaceport attachment succeeded, run `Get-PhysicalDisk` once and read:
+
+```text
+x *!SmbiosSpaceportIoctlSnapshot
+dq <address-reported-by-x> L5
+```
+
+The five 64-bit fields, in order, are:
+
+| Byte offset | Field | Meaning |
+| --- | --- | --- |
+| 0x00 | requests | Requests that registered an opt-in completion |
+| 0x08 | completions | Invoked completion callbacks, regardless of status |
+| 0x10 | successful_completions | Completion status with nonnegative NTSTATUS |
+| 0x18 | last_status | Last completion NTSTATUS encoded as unsigned low 32 bits |
+| 0x20 | last_information | Last `IoStatus.Information` value, in bytes |
+
+These are global, monotonic counters since driver load, not per-process or
+per-disk data. Values may change while they are read. A zero count does **not**
+rule out Storage Spaces activity: request completion may be served before the
+filter attaches, via another device stack or cache, or a different query path.
+A count greater than zero proves only that the observed numeric IOCTL reached
+the marked attachment; it does not authenticate the response layout, identify
+which disk was queried, or prove the candidate offset `0xA3C` is correct.
+
+**Operational warning:** this is a diagnostic kernel build and has not been
+validated on live Windows hardware. Do not deploy automatically. The existing
+unload implementation uses a bounded wait for outstanding completion callbacks;
+this diagnostic adds one possible callback path but does not fix unload rundown.
+Avoid unloading/reloading the diagnostic driver while requests are in flight.
+No serial or response bytes are logged or exported by this feature.
