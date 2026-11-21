@@ -199,7 +199,9 @@ function Install-WindowsDiskFilterDriver {
     }
 
     $imagePath = "System32\drivers\$filename"
-    $service = Get-Service -Name $DriverServiceName -ErrorAction SilentlyContinue
+    # Kernel driver services are reliably enumerated by Win32_SystemDriver;
+    # Get-Service may omit device drivers on some Windows installations.
+    $service = Get-CimInstance Win32_SystemDriver -Filter "Name = '$DriverServiceName'" -ErrorAction SilentlyContinue
     if ($service) {
         & sc.exe config $DriverServiceName type= kernel start= system error= ignore binPath= $imagePath
         if ($LASTEXITCODE -ne 0) {
@@ -218,8 +220,10 @@ function Install-WindowsDiskFilterDriver {
 
 function Uninstall-WindowsDiskFilterDriver {
     # Never call sc stop: unload rundown for this filter is not yet proven.
-    $service = Get-Service -Name $DriverServiceName -ErrorAction SilentlyContinue
-    $wasRunning = $service -and $service.Status -eq 'Running'
+    # Kernel driver services are reliably enumerated by Win32_SystemDriver;
+    # Get-Service may omit device drivers on some Windows installations.
+    $service = Get-CimInstance Win32_SystemDriver -Filter "Name = '$DriverServiceName'" -ErrorAction SilentlyContinue
+    $wasRunning = $service -and $service.State -eq 'Running'
 
     if ($service) {
         & sc.exe config $DriverServiceName start= disabled
