@@ -133,7 +133,7 @@ Get-Date -Format o
 Get-PhysicalDisk | Select-Object DeviceId,FriendlyName,Size,UniqueId,SerialNumber
 Get-Date -Format o
 Get-Disk -Number 0 | Select-Object Number,FriendlyName,Size,UniqueId,SerialNumber
-.\storage-query.exe --vpd80
+.\target\x86_64-pc-windows-msvc\debug\storage-query.exe --vpd80
 ```
 
 The expected split is recorded above. For the supplied results this comparison is already complete. Repeating it or querying service state cannot resolve the cause. For an **existing boot ETL**, open it in Windows Performance Analyzer and inspect the interval from device arrival through the first provider enumeration, then the timestamped provider-only window above if covered. Correlate activity/related IDs, device instance or target, process/thread and request/completion pairs where recorded. Separate the later direct probe. Apply these evidence criteria:
