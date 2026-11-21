@@ -149,6 +149,13 @@ function Install-WindowsDiskFilterDriver {
         throw "No built driver in $LocalDriverCopy. Run .\install.ps1 -Mode build-only first."
     }
     Write-Step "Preparing versioned, signed kernel image; no in-place replacement of running drivers."
+    $bcd = (& bcdedit /enum "{current}" 2>&1) | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "Unable to read Windows boot signing policy (bcdedit)." }
+    if ($bcd -notmatch '(?im)^\s*testsigning\s+Yes\b') {
+        Write-Warn "Enabling Windows test-signing policy for self-signed kernel driver; reboot required."
+        & bcdedit /set "{current}" testsigning on
+        if ($LASTEXITCODE -ne 0) { throw "Cannot enable testsigning (e.g. Secure Boot policy). Driver installation stopped." }
+    }
     $sourceHash = (Get-FileHash -LiteralPath $LocalDriverCopy -Algorithm SHA256).Hash.ToLowerInvariant()
     $filename = "smbios-disk-filter-r$($sourceHash.Substring(0,16)).sys"
     $target = Join-Path $DriverDirectory $filename
@@ -213,7 +220,6 @@ function Uninstall-WindowsDiskFilterDriver {
     # Never call sc stop: unload rundown for this filter is not yet proven.
     $service = Get-Service -Name $DriverServiceName -ErrorAction SilentlyContinue
     $wasRunning = $service -and $service.Status -eq 'Running'
-    $activePath = Get-ConfiguredSpooferDriverPath
 
     if ($service) {
         & sc.exe config $DriverServiceName start= disabled
@@ -224,10 +230,13 @@ function Uninstall-WindowsDiskFilterDriver {
     }
 
     $remaining = @()
+    # Current ImagePath may already point at a *different* next-boot image.
+    # Consequently we cannot identify the loaded image from SCM configuration.
+    # When RUNNING, leave ALL project driver files intact until the reboot.
     foreach ($path in @(Get-SpooferDriverArtifacts | Sort-Object -Unique)) {
-        if ($wasRunning -and $activePath -and $path -ieq $activePath) {
-            Write-Warn "Keeping loaded image until after reboot: $path"
+        if ($wasRunning) {
             $remaining += $path
+            Write-Warn "Preserving image while filter is running: $path"
             continue
         }
         try {
