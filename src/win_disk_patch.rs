@@ -951,6 +951,35 @@ mod tests {
     }
 
     #[test]
+    fn test_opt_in_namespace_id_property_route() {
+        let mut request = [0u8; 8];
+        request[..4].copy_from_slice(&STORAGE_DEVICE_ID_PROPERTY.to_le_bytes());
+        assert_eq!(
+            classify_ioctl_request(IOCTL_STORAGE_QUERY_PROPERTY, &request),
+            TAG_STORAGE_DEVICE_ID
+        );
+        let serial = b"D1F9V96CQUN4DJ7     ";
+        let mut response = [0u8; 64];
+        response[0..4].copy_from_slice(&12u32.to_le_bytes());
+        response[4..8].copy_from_slice(&64u32.to_le_bytes());
+        response[8..12].copy_from_slice(&1u32.to_le_bytes());
+        response[12..16].copy_from_slice(&3u32.to_le_bytes());
+        response[16..20].copy_from_slice(&8u32.to_le_bytes());
+        response[20..22].copy_from_slice(&36u16.to_le_bytes());
+        response[28..64].copy_from_slice(b"eui.000000000000000100A07523453E0948");
+        let before = response;
+        assert!(!patch_ioctl_output_by_tag(
+            TAG_STORAGE_DEVICE_ID, &mut response, serial
+        ));
+        assert_eq!(response, before);
+        assert!(patch_ioctl_output_with_namespace_id(
+            TAG_STORAGE_DEVICE_ID, &mut response, serial
+        ));
+        assert_ne!(&response[28..64], &before[28..64]);
+        assert_eq!(&response[..28], &before[..28]);
+    }
+
+    #[test]
     fn test_patch_storage_adapter_serial_utf16() {
         let mut buf = [0u8; 264];
         buf[0..4].copy_from_slice(&264u32.to_le_bytes());
