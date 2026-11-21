@@ -22,3 +22,5 @@ strip = false
 
 [features]
 attachment-diagnostics = []
+# Experimental; only for the observed Micron 2400 response with exact old string.
+spaceport-serial-patch = ["attachment-diagnostics"]
