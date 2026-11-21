@@ -442,10 +442,11 @@ fn scsi_vpd80_transfer(buf: &[u8]) -> Option<(usize, usize)> {
         return None;
     }
 
-    let &[0x12, 0x01, 0x80, high, low, 0] = header[SCSI_CDB_OFFSET..].first_chunk::<6>()? else {
+    let &[0x12, 0x01, 0x80, 0, allocation, 0] = header[SCSI_CDB_OFFSET..].first_chunk::<6>()?
+    else {
         return None;
     };
-    let allocation = usize::from(u16::from_be_bytes([high, low]));
+    let allocation = usize::from(allocation);
     let transfer_length =
         u32::from_le_bytes(*header[SCSI_TRANSFER_LENGTH..].first_chunk::<4>()?) as usize;
     let data_offset = usize::from_le_bytes(*header[SCSI_DATA_OFFSET..].first_chunk()?);
@@ -560,6 +561,7 @@ mod tests {
             (37, 0),    // Standard INQUIRY
             (37, 3),    // EVPD and a reserved bit
             (38, 0x83), // Device Identification
+            (39, 1),    // Unsupported high allocation byte
             (40, 43),   // Allocation length smaller than the transfer
             (41, 1),    // Nonstandard control byte
         ] {
@@ -614,20 +616,17 @@ mod tests {
     }
 
     #[test]
-    fn test_scsi_pass_through_uses_both_page_length_bytes() {
+    fn test_scsi_pass_through_rejects_vpd_length_exceeding_maximum_inquiry_transfer() {
         let fixture = micron_vpd80_completion();
-        let mut buf = [0; 56 + 260 + 1];
+        let mut buf = [b'A'; 56 + 255];
         buf[..56].copy_from_slice(&fixture[..56]);
-        buf[12..16].copy_from_slice(&260u32.to_le_bytes());
-        buf[39..41].copy_from_slice(&260u16.to_be_bytes());
-        buf[56..60].copy_from_slice(&[0, 0x80, 1, 0]);
-        buf[60..316].fill(b'A');
-        buf[316] = 0xA5;
-        let mut expected = buf;
-        expected[60..316].fill(b' ');
-        expected[60..75].copy_from_slice(b"XKNVHETV1TXQNT3");
-        assert!(patch_scsi_pass_through(&mut buf, b"XKNVHETV1TXQNT3     "));
-        assert_eq!(buf, expected);
+        buf[12..16].copy_from_slice(&255u32.to_le_bytes());
+        // A valid 255-byte request cannot hold this header plus 257 payload bytes.
+        // Reading only the low byte would incorrectly accept a one-byte serial.
+        buf[56..60].copy_from_slice(&[0, 0x80, 1, 1]);
+        let original = buf;
+        assert!(!patch_scsi_pass_through(&mut buf, b"XKNVHETV1TXQNT3     "));
+        assert_eq!(buf, original);
     }
 
     #[test]
