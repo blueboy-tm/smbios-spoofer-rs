@@ -9,8 +9,8 @@
       - install       (default) : Checks/installs Rust + UEFI target, runs unit tests, builds .efi,
                                   mounts the EFI System Partition (ESP), copies smbios-spoofer.efi,
                                   and configures the UEFI BootOrder entry #1 automatically via bcdedit.
-      - status                  : Displays current Windows SMBIOS identifiers (WMI/CIM), compares
-                                  against the pre-spoof snapshot if present, and checks ESP / bcdedit.
+      - status                  : Displays Windows CIM and registry identifiers, compares them with
+                                  the snapshot, and checks the ESP profile, firmware entries, and driver service.
       - build-only              : Runs unit tests and compiles the UEFI binary (.efi) only.
       - install-only            : Deploys an already built .efi binary to the ESP and configures bcdedit.
       - reset-profile           : Removes the persisted profile (\EFI\SmbiosSpoofer\uuid.dat) to force
@@ -614,19 +614,104 @@ function Uninstall-WindowsDiskFilterDriver {
 
 # --- Status / Verification Mode ----------------------------------------------
 
+function Get-V9ProfileValidation([byte[]]$Bytes) {
+    # Packed SpoofConfig in src/persistence.rs and parse_v9_config_bytes in driver/src/lib.rs.
+    $expectedSize = 1710
+    if ($Bytes.Length -ne $expectedSize) {
+        return [pscustomobject]@{ Valid = $false; Reason = "Expected $expectedSize bytes, found $($Bytes.Length)." }
+    }
+
+    $magic = [BitConverter]::ToUInt32($Bytes, 0)
+    if ($magic -ne 0x534D4249) {
+        return [pscustomobject]@{ Valid = $false; Reason = ("Expected magic 0x534D4249, found 0x{0:X8}." -f $magic) }
+    }
+    $version = [BitConverter]::ToUInt32($Bytes, 4)
+    if ($version -ne 9) {
+        return [pscustomobject]@{ Valid = $false; Reason = "Expected version 9, found version $version." }
+    }
+
+    $checksumOffset = $expectedSize - 4
+    $storedChecksum = [BitConverter]::ToUInt32($Bytes, $checksumOffset)
+    $computedChecksum = 0
+    for ($i = 0; $i -lt $checksumOffset; $i++) {
+        $computedChecksum += $Bytes[$i]
+    }
+    if ($storedChecksum -ne $computedChecksum) {
+        $reason = "Checksum mismatch (stored 0x{0:X8}, computed 0x{1:X8})." -f $storedChecksum, $computedChecksum
+        return [pscustomobject]@{ Valid = $false; Reason = $reason }
+    }
+
+    # Apply the UEFI serial plausibility rule to the saved value and the driver's
+    # alphanumeric minimum to the first 20 UTF-16LE code units it consumes.
+    $serialField = [System.Text.Encoding]::Unicode.GetString($Bytes, 1574, 128)
+    $terminator = $serialField.IndexOf([char]0)
+    if ($terminator -lt 0) {
+        return [pscustomobject]@{ Valid = $false; Reason = "Disk serial is missing its NUL terminator." }
+    }
+    $serial = $serialField.Substring(0, $terminator)
+    if ($serial -cmatch '[^A-Za-z0-9_. -]') {
+        return [pscustomobject]@{ Valid = $false; Reason = "Disk serial contains characters outside ASCII letters, digits, spaces, '_', '-', and '.'." }
+    }
+    $driverPrefix = $serial.Substring(0, [Math]::Min(20, $serial.Length))
+    if ([regex]::Matches($driverPrefix, '[A-Za-z0-9]').Count -lt 4) {
+        return [pscustomobject]@{ Valid = $false; Reason = "Disk serial needs at least four ASCII letters or digits in its first 20 characters." }
+    }
+
+    $uuid = [BitConverter]::ToString($Bytes, 8, 16).Replace('-', '')
+    $uuid = "{0}-{1}-{2}-{3}-{4}" -f $uuid.Substring(0,8), $uuid.Substring(8,4), $uuid.Substring(12,4), $uuid.Substring(16,4), $uuid.Substring(20,12)
+    return [pscustomobject]@{ Valid = $true; Version = $version; UUID = $uuid; DiskSerial = $serial }
+}
+
+function Show-EspProfileStatus([string]$Path) {
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($Path)
+    } catch [System.IO.FileNotFoundException], [System.IO.DirectoryNotFoundException] {
+        Write-Warn "ESP uuid.dat missing ($EfiProfileRelPath)."
+        return
+    } catch {
+        Write-Warn "ESP uuid.dat could not be validated ($($_.Exception.Message))."
+        return
+    }
+
+    $result = Get-V9ProfileValidation -Bytes $bytes
+    if ($result.Valid) {
+        Write-Ok "ESP uuid.dat valid (v$($result.Version))"
+        Write-Host "    Profile UUID        : $($result.UUID)"
+        Write-Host "    Profile Disk Serial : $($result.DiskSerial)"
+    } else {
+        Write-Warn "ESP uuid.dat invalid. $($result.Reason)"
+    }
+}
+
+function Show-DriverServiceStatus {
+    Write-Host ""
+    Write-Step "Kernel driver service state (Win32_SystemDriver)"
+    try {
+        $service = Get-CimInstance -ClassName Win32_SystemDriver -Filter "Name = '$DriverServiceName'" -ErrorAction Stop
+        if ($service) {
+            Write-Host "    $($service.Name) : $($service.State)"
+        } else {
+            Write-Warn "Kernel driver service '$DriverServiceName' was not found."
+        }
+    } catch {
+        Write-Warn "Could not query '$DriverServiceName' ($($_.Exception.Message))."
+    }
+    Write-Host "    Service state only. IOCTL interception requires a separate test."
+}
+
 function Show-FieldComparison([string]$Label, [string]$Current, [string]$Before) {
     $padLabel = $Label.PadRight(20)
     if ([string]::IsNullOrWhiteSpace($Before)) {
         Write-Host ("    {0} : {1}" -f $padLabel, $Current) -ForegroundColor White
     } elseif ($Current -ne $Before) {
-        Write-Host ("    {0} : {1}  [SPOOFED - before: {2}]" -f $padLabel, $Current, $Before) -ForegroundColor Green
+        Write-Host ("    {0} : {1}  [CHANGED - before: {2}]" -f $padLabel, $Current, $Before) -ForegroundColor Green
     } else {
         Write-Host ("    {0} : {1}  [UNCHANGED]" -f $padLabel, $Current) -ForegroundColor Yellow
     }
 }
 
 function Invoke-StatusCheck {
-    Write-Step "Reading active SMBIOS tables from Windows (WMI/CIM)..."
+    Write-Step "Reading Windows CIM and registry identifiers..."
     $curr = Get-CurrentSmbiosSnapshot
     $prev = $null
     if (Test-Path $SnapshotFile) {
@@ -651,20 +736,18 @@ function Invoke-StatusCheck {
     $prevHwId     = if ($prev -and $prev.PSObject.Properties["ComputerHardwareId"]) { [string]$prev.ComputerHardwareId } else { "" }
 
     Write-Host ""
-    Write-Host "  --- Current Windows SMBIOS & Hardware Identifiers -------------------" -ForegroundColor Cyan
+    Write-Step "Windows-reported hardware identifiers (CIM Win32_* classes)"
     Show-FieldComparison "System UUID"       $curr.UUID               $prevUUID
-    Show-FieldComparison "System Serial"     $curr.SystemSerial       $prevSysSer
+    Show-FieldComparison "BIOS Serial"       $curr.SystemSerial       $prevSysSer
     Show-FieldComparison "System SKU"        $curr.SystemSKU          $prevSysSku
     Show-FieldComparison "Baseboard Model"   $curr.BaseboardProduct   $prevBbProd
     Show-FieldComparison "Baseboard Serial"  $curr.BaseboardSerial    $prevBbSer
     Show-FieldComparison "Chassis Serial"    $curr.ChassisSerial      $prevChSer
     Show-FieldComparison "Chassis AssetTag"  $curr.ChassisAssetTag    $prevChAsset
-    Show-FieldComparison "Processor Serial"  $curr.ProcessorSerial    $prevProcSer
+    Show-FieldComparison "Processor Serial/ID" $curr.ProcessorSerial  $prevProcSer
     Show-FieldComparison "BIOS Vendor"       $curr.BiosManufacturer   $prevBiosVen
     Show-FieldComparison "BIOS Version"      $curr.BiosVersion        $prevBiosVer
     Show-FieldComparison "BIOS Date"         $curr.BiosReleaseDate    $prevBiosDate
-    Show-FieldComparison "MachineGuid"       $curr.MachineGuid        $prevMachGuid
-    Show-FieldComparison "HardwareId"        $curr.ComputerHardwareId $prevHwId
 
     for ($i = 0; $i -lt $curr.RamModules.Count; $i++) {
         $rm = $curr.RamModules[$i]
@@ -685,12 +768,17 @@ function Invoke-StatusCheck {
         }
         $currDiskDisplay = "$($dd.SerialNumber) ($($dd.Model))"
         $prevDiskDisplay = if ($prevDiskSerial) { "$prevDiskSerial ($($dd.Model))" } else { "" }
-        Show-FieldComparison ("Disk[$i] Serial") $currDiskDisplay $prevDiskDisplay
+        Show-FieldComparison ("Disk[$i] Serial (Win32_DiskDrive)") $currDiskDisplay $prevDiskDisplay
     }
+    Write-Host ""
+    Write-Step "Windows-reported identifiers (registry)"
+    Show-FieldComparison "MachineGuid"         $curr.MachineGuid        $prevMachGuid
+    Show-FieldComparison "ComputerHardwareId"  $curr.ComputerHardwareId $prevHwId
     if ($curr.ScsiRegSerial) {
-        $prevScsi = if ($prev -and $prev.DiskDrives -and @($prev.DiskDrives).Count -gt 0) { [string](@($prev.DiskDrives)[0].SerialNumber) } else { "" }
-        Show-FieldComparison "Disk[0] ScsiReg" $curr.ScsiRegSerial $prevScsi
+        $prevScsi = if ($prev) { [string]$prev.ScsiRegSerial } else { "" }
+        Show-FieldComparison "First DEVICEMAP SCSI serial" $curr.ScsiRegSerial $prevScsi
     }
+    Show-DriverServiceStatus
     Write-Host ""
 
     if (Test-Path $BuiltEfiPath) {
@@ -703,7 +791,7 @@ function Invoke-StatusCheck {
     if (Test-IsAdmin) {
         $guids = Get-SpooferFirmwareGuids
         if ($guids.Count -gt 0) {
-            Write-Ok "Active bcdedit UEFI entry: $($guids -join ', ')"
+            Write-Ok "UEFI entries found by bcdedit: $($guids -join ', ')"
         } else {
             Write-Warn "No '$BootEntryDescription' entry found in bcdedit /enum firmware"
         }
@@ -720,45 +808,8 @@ function Invoke-StatusCheck {
                 Write-Warn "ESP binary missing : $EfiRelPath"
             }
 
-            if (Test-Path $uuidDat) {
-                $bytes = [System.IO.File]::ReadAllBytes($uuidDat)
-                if ($bytes.Length -ge 24) {
-                    $magic = [BitConverter]::ToUInt32($bytes, 0)
-                    $ver   = [BitConverter]::ToUInt32($bytes, 4)
-                    $uuidHex = ($bytes[8..23] | ForEach-Object { $_.ToString("X2") }) -join ""
-                    $uuidFmt = "{0}-{1}-{2}-{3}-{4}" -f $uuidHex.Substring(0,8), $uuidHex.Substring(8,4), $uuidHex.Substring(12,4), $uuidHex.Substring(16,4), $uuidHex.Substring(20,12)
-                    Write-Ok ("ESP uuid.dat valid : Magic=0x{0:X8}, Version=v{1}, UUID={2}" -f $magic, $ver, $uuidFmt)
-                    if ($ver -ge 9 -and $bytes.Length -ge 1710) {
-                        $diskChars = New-Object System.Text.StringBuilder
-                        for ($k = 0; $k -lt 64; $k++) {
-                            $ch = [BitConverter]::ToUInt16($bytes, 1574 + ($k * 2))
-                            if ($ch -eq 0) { break }
-                            if ($ch -ge 32 -and $ch -le 126) {
-                                [void]$diskChars.Append([char]$ch)
-                            }
-                        }
-                        $espDiskSerial = $diskChars.ToString().Trim()
-                        if ($espDiskSerial) {
-                            Write-Ok "ESP v9 Disk Serial : $espDiskSerial (pre-boot UEFI + kernel filter target)"
-                        }
-                    }
-                } else {
-                    Write-Warn "ESP uuid.dat present but unexpected size ($($bytes.Length) bytes)"
-                }
-            } else {
-                Write-Warn "No $EfiProfileRelPath on ESP yet (will be created on first UEFI boot)"
-            }
-        }
-
-        $drvSvc = Get-Service -Name $DriverServiceName -ErrorAction SilentlyContinue
-        if ($drvSvc) {
-            if ($drvSvc.Status -eq 'Running') {
-                Write-Ok "Windows Disk Filter: $DriverServiceName is RUNNING (Ring 0 IOCTL interception active)"
-            } else {
-                Write-Warn "Windows Disk Filter: $DriverServiceName installed (Status: $($drvSvc.Status) -- reboot with testsigning ON to activate)"
-            }
-        } else {
-            Write-Warn "Windows Disk Filter: Not installed yet (run '.\install.ps1 -Mode install-driver' to spoof Disk[0] under Windows)"
+            Write-Step "Saved profile on the EFI System Partition"
+            Show-EspProfileStatus -Path $uuidDat
         }
     } else {
         Write-Warn "Run as Administrator to also inspect the EFI System Partition (ESP) and bcdedit BootOrder."
