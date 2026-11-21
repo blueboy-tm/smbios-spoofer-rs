@@ -16,6 +16,18 @@
 //! 4. `IOCTL_ATA_PASS_THROUGH` (`0x0004D02C`) -> `ATA_PASS_THROUGH_EX`
 //! 5. `IOCTL_SCSI_PASS_THROUGH` (`0x0004D004`) / SCSI `INQUIRY` VPD Page `0x80`
 
+use core::mem::{offset_of, size_of};
+
+#[path = "scsi_pass_through.rs"]
+mod scsi_pass_through;
+use scsi_pass_through::ScsiPassThrough;
+
+const SCSI_HEADER_SIZE: usize = size_of::<ScsiPassThrough>();
+const SCSI_TRANSFER_LENGTH: usize = offset_of!(ScsiPassThrough, transfer_length);
+const SCSI_DATA_OFFSET: usize = offset_of!(ScsiPassThrough, data_buffer_offset);
+const SCSI_SENSE_OFFSET: usize = offset_of!(ScsiPassThrough, sense_info_offset);
+const SCSI_CDB_OFFSET: usize = offset_of!(ScsiPassThrough, cdb);
+
 /// `IOCTL_STORAGE_QUERY_PROPERTY` (`CTL_CODE(IOCTL_STORAGE_BASE, 0x0500, METHOD_BUFFERED, FILE_ANY_ACCESS)`)
 pub const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002D_1400;
 
@@ -98,7 +110,9 @@ pub fn classify_ioctl_request(io_control_code: u32, input_buf: &[u8]) -> u8 {
         }
         SMART_RCV_DRIVE_DATA => TAG_SMART_RCV_DRIVE_DATA,
         IOCTL_ATA_PASS_THROUGH => TAG_ATA_PASS_THROUGH,
-        IOCTL_SCSI_PASS_THROUGH => TAG_SCSI_PASS_THROUGH,
+        IOCTL_SCSI_PASS_THROUGH if scsi_vpd80_transfer(input_buf).is_some() => {
+            TAG_SCSI_PASS_THROUGH
+        }
         _ => TAG_NONE,
     }
 }
@@ -165,9 +179,7 @@ fn find_stornvme_nsid_suffix(s: &[u8]) -> Option<usize> {
     }
     let suffix_start = s.len() - 10;
     let suffix = &s[suffix_start..];
-    if suffix[0] == b'_'
-        && suffix[9] == b'.'
-        && suffix[1..9].iter().all(|&c| c.is_ascii_hexdigit())
+    if suffix[0] == b'_' && suffix[9] == b'.' && suffix[1..9].iter().all(|&c| c.is_ascii_hexdigit())
     {
         return Some(suffix_start);
     }
@@ -418,38 +430,65 @@ pub fn patch_ata_pass_through(buf: &mut [u8], new_serial: &[u8; 20]) -> bool {
     false
 }
 
-/// 5. Patches `SCSI_PASS_THROUGH` (`IOCTL_SCSI_PASS_THROUGH`, 64-bit layout) when CDB is `INQUIRY (0x12)`.
-pub fn patch_scsi_pass_through(buf: &mut [u8], new_serial: &[u8; 20]) -> bool {
-    // On x64, `SCSI_PASS_THROUGH` has `DataBufferOffset` at 32..40 and `Cdb[16]` at 44..60
-    if buf.len() < 64 {
-        return false;
+/// Validate the request and return its data offset and transfer length. For a
+/// data-in command the dispatch buffer may contain only the fixed header.
+fn scsi_vpd80_transfer(buf: &[u8]) -> Option<(usize, usize)> {
+    let header = buf.first_chunk::<SCSI_HEADER_SIZE>()?;
+    if u16::from_le_bytes([header[0], header[1]]) as usize != SCSI_HEADER_SIZE
+        || header[offset_of!(ScsiPassThrough, cdb_length)] != 6
+        || header[offset_of!(ScsiPassThrough, data_in)] != 1
+    // SCSI_IOCTL_DATA_IN
+    {
+        return None;
     }
-    let data_offset = u64::from_le_bytes([
-        buf[32], buf[33], buf[34], buf[35], buf[36], buf[37], buf[38], buf[39],
-    ]) as usize;
-    if data_offset < 56 || data_offset + 4 > buf.len() {
-        return false;
-    }
-    patch_scsi_vpd_inquiry(&mut buf[data_offset..], new_serial)
-}
 
-/// Patches a raw SCSI `INQUIRY` response buffer (VPD Page `0x80` Unit Serial Number or Standard Inquiry).
-pub fn patch_scsi_vpd_inquiry(inq: &mut [u8], new_serial: &[u8; 20]) -> bool {
-    if inq.len() < 8 {
-        return false;
+    let &[0x12, 0x01, 0x80, high, low, 0] = header[SCSI_CDB_OFFSET..].first_chunk::<6>()? else {
+        return None;
+    };
+    let allocation = usize::from(u16::from_be_bytes([high, low]));
+    let transfer_length =
+        u32::from_le_bytes(*header[SCSI_TRANSFER_LENGTH..].first_chunk::<4>()?) as usize;
+    let data_offset = usize::from_le_bytes(*header[SCSI_DATA_OFFSET..].first_chunk()?);
+    if data_offset < SCSI_HEADER_SIZE || !(4..=allocation).contains(&transfer_length) {
+        return None;
     }
-    // VPD Page 0x80 (`Unit Serial Number`): byte 1 == 0x80, byte 3 == page_length
-    if inq[1] == 0x80 {
-        let page_len = inq[3] as usize;
-        if page_len > 0 && 4 + page_len <= inq.len() {
-            return patch_ascii_serial_slice(&mut inq[4..4 + page_len], new_serial);
+    let sense_length = usize::from(header[offset_of!(ScsiPassThrough, sense_info_length)]);
+    if sense_length != 0 {
+        let sense_offset =
+            u32::from_le_bytes(*header[SCSI_SENSE_OFFSET..].first_chunk::<4>()?) as usize;
+        if sense_offset < SCSI_HEADER_SIZE || sense_offset.checked_add(sense_length)? > data_offset
+        {
+            return None;
         }
     }
-    // Standard Inquiry (`byte 1 == 0x00`, vendor-specific serial at 36..56 if printable)
-    if inq[1] == 0x00 && inq.len() >= 56 && is_printable_ascii(&inq[36..56]) {
-        return patch_ascii_serial_slice(&mut inq[36..56], new_serial);
+    Some((data_offset, transfer_length))
+}
+
+/// Patches only the Unit Serial Number page of a successful buffered INQUIRY.
+pub fn patch_scsi_pass_through(buf: &mut [u8], new_serial: &[u8; 20]) -> bool {
+    let Some((data_offset, transfer_length)) = scsi_vpd80_transfer(buf) else {
+        return false;
+    };
+    if buf[offset_of!(ScsiPassThrough, scsi_status)] != 0 {
+        return false;
     }
-    false
+    let Some(data) = buf
+        .get_mut(data_offset..)
+        .and_then(|data| data.get_mut(..transfer_length))
+    else {
+        return false;
+    };
+    let Some(&[_, 0x80, high, low]) = data.first_chunk() else {
+        return false;
+    };
+    let page_length = usize::from(u16::from_be_bytes([high, low]));
+    let Some(serial) = data.get_mut(4..4 + page_length) else {
+        return false;
+    };
+    if !serial.iter().all(|b| (b' '..=b'~').contains(b)) {
+        return false;
+    }
+    patch_ascii_serial_slice(serial, new_serial)
 }
 
 #[inline]
@@ -477,6 +516,146 @@ fn is_printable_ascii(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MICRON_VPD80: &[u8; 44] = b"\x00\x80\x00\x280000_0000_0000_0001_00A0_7523_453E_0948.";
+
+    fn micron_vpd80_completion() -> [u8; 100] {
+        // Independent x64 WDK fixture: 56-byte header, then the 44-byte reply.
+        let mut buf = [0; 100];
+        buf[..2].copy_from_slice(&56u16.to_le_bytes());
+        buf[6] = 6; // CdbLength
+        buf[8] = 1; // SCSI_IOCTL_DATA_IN
+        buf[12..16].copy_from_slice(&44u32.to_le_bytes());
+        buf[16..20].copy_from_slice(&10u32.to_le_bytes());
+        buf[24..32].copy_from_slice(&56u64.to_le_bytes());
+        buf[36..42].copy_from_slice(&[0x12, 1, 0x80, 0, 255, 0]);
+        buf[56..].copy_from_slice(MICRON_VPD80);
+        buf
+    }
+
+    #[test]
+    fn test_scsi_pass_through_updates_exact_micron_vpd80_serial() {
+        let mut buf = micron_vpd80_completion();
+        let mut request: [u8; 56] = buf[..56].try_into().unwrap();
+        request[12..16].copy_from_slice(&255u32.to_le_bytes()); // Original allocation before underrun.
+        let tag = classify_ioctl_request(IOCTL_SCSI_PASS_THROUGH, &request);
+        assert_eq!(tag, TAG_SCSI_PASS_THROUGH);
+        let mut expected = buf;
+        expected[60..].fill(b' ');
+        expected[60..75].copy_from_slice(b"XKNVHETV1TXQNT3");
+        let serial = b"XKNVHETV1TXQNT3     ";
+
+        assert!(patch_ioctl_output_by_tag(tag, &mut buf, serial));
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn test_scsi_pass_through_rejects_other_requests_at_dispatch_and_completion() {
+        for (offset, value) in [
+            (0, 44),    // 32-bit SCSI_PASS_THROUGH header length
+            (6, 10),    // CdbLength
+            (8, 0),     // Data-out
+            (8, 2),     // Unspecified direction
+            (36, 0x28), // READ(10) opcode
+            (37, 0),    // Standard INQUIRY
+            (37, 3),    // EVPD and a reserved bit
+            (38, 0x83), // Device Identification
+            (40, 43),   // Allocation length smaller than the transfer
+            (41, 1),    // Nonstandard control byte
+        ] {
+            let mut buf = micron_vpd80_completion();
+            buf[offset] = value;
+            let original = buf;
+            assert_eq!(
+                classify_ioctl_request(IOCTL_SCSI_PASS_THROUGH, &buf[..56]),
+                TAG_NONE
+            );
+            assert!(!patch_ioctl_output_by_tag(
+                TAG_SCSI_PASS_THROUGH,
+                &mut buf,
+                b"XKNVHETV1TXQNT3     "
+            ));
+            assert_eq!(buf, original);
+        }
+    }
+
+    #[test]
+    fn test_scsi_pass_through_rejects_invalid_completion_bounds_and_status() {
+        let serial = b"XKNVHETV1TXQNT3     ";
+        let mut buf = micron_vpd80_completion();
+        let original = buf;
+        // Backing memory contains the reply, but the completion's valid slice is shorter.
+        for returned in 0..buf.len() {
+            assert!(!patch_scsi_pass_through(&mut buf[..returned], serial));
+            assert_eq!(buf, original);
+        }
+        for (offset, value) in [
+            (2, 2),    // CHECK CONDITION, even with successful NTSTATUS
+            (7, 8),    // Sense length extending into data with the offset below
+            (12, 43),  // Page exceeds the transfer length
+            (12, 45),  // Transfer exceeds bytes returned
+            (24, 55),  // Offset points inside the fixed header
+            (24, 255), // Offset points beyond the returned buffer
+            (58, 1),   // High byte of page length makes the page too large
+        ] {
+            let mut buf = original;
+            if offset == 7 {
+                buf[32..36].copy_from_slice(&56u32.to_le_bytes());
+            }
+            buf[offset] = value;
+            let invalid = buf;
+            assert!(!patch_scsi_pass_through(&mut buf, serial));
+            assert_eq!(buf, invalid);
+        }
+        buf[24..32].copy_from_slice(&u64::MAX.to_le_bytes());
+        let invalid = buf;
+        assert!(!patch_scsi_pass_through(&mut buf, serial));
+        assert_eq!(buf, invalid);
+    }
+
+    #[test]
+    fn test_scsi_pass_through_uses_both_page_length_bytes() {
+        let fixture = micron_vpd80_completion();
+        let mut buf = [0; 56 + 260 + 1];
+        buf[..56].copy_from_slice(&fixture[..56]);
+        buf[12..16].copy_from_slice(&260u32.to_le_bytes());
+        buf[39..41].copy_from_slice(&260u16.to_be_bytes());
+        buf[56..60].copy_from_slice(&[0, 0x80, 1, 0]);
+        buf[60..316].fill(b'A');
+        buf[316] = 0xA5;
+        let mut expected = buf;
+        expected[60..316].fill(b' ');
+        expected[60..75].copy_from_slice(b"XKNVHETV1TXQNT3");
+        assert!(patch_scsi_pass_through(&mut buf, b"XKNVHETV1TXQNT3     "));
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn test_scsi_pass_through_preserves_identifiers_and_non_text_payloads() {
+        let serial = b"XKNVHETV1TXQNT3     ";
+        let name = b"eui.000000000000000100A07523453E0948";
+        let mut buf = micron_vpd80_completion();
+        buf[56..64].copy_from_slice(&[0, 0x83, 0, 40, 3, 8, 0, 36]);
+        buf[64..].copy_from_slice(name);
+        let different_page = buf;
+        assert!(!patch_scsi_pass_through(&mut buf, serial));
+        assert_eq!(buf, different_page);
+        buf[38] = 0x83;
+        let page83 = buf;
+        assert!(!patch_scsi_pass_through(&mut buf, serial));
+        assert_eq!(buf, page83);
+
+        let mut buf = micron_vpd80_completion();
+        buf[59] = 36;
+        buf[60..96].copy_from_slice(name);
+        let eui = buf;
+        assert!(!patch_scsi_pass_through(&mut buf, serial));
+        assert_eq!(buf, eui);
+        buf[60] = 0;
+        let opaque = buf;
+        assert!(!patch_scsi_pass_through(&mut buf, serial));
+        assert_eq!(buf, opaque);
+    }
 
     #[test]
     fn test_storage_device_id_preserves_reported_eui() {
