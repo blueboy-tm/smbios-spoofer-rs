@@ -33,6 +33,10 @@ jobs:
       - name: Run Host Unit & Integration Tests
         run: cargo test --target x86_64-pc-windows-msvc
 
+      - name: Test status profile validation
+        shell: powershell
+        run: ./tests/status-profile.Tests.ps1
+
       - name: Build UEFI Release Binary (GOP GUI Mode)
         run: cargo build --release --target x86_64-unknown-uefi
 
