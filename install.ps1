@@ -436,6 +436,13 @@ function Invoke-EspInstall {
         return
     }
 
+    # Validate/sign/stage the Windows driver BEFORE changing the EFI boot entry.
+    # If signing fails, the existing UEFI configuration stays untouched.
+    if (-not (Test-Path -LiteralPath $LocalDriverCopy)) {
+        throw "Driver build artifact missing. Run .\\install.ps1 -Mode build-only first."
+    }
+    Install-WindowsDiskFilterDriver
+
     Invoke-WithMountedEsp {
         param($espDrive)
 
@@ -455,11 +462,6 @@ function Invoke-EspInstall {
 
         Register-UefiBootEntry -EspDrive $espDrive
     }
-
-    if (-not (Test-Path -LiteralPath $LocalDriverCopy)) {
-        throw "Driver build artifact missing. Run .\\install.ps1 -Mode build-only first."
-    }
-    Install-WindowsDiskFilterDriver
 
     Write-Host ""
     Write-Host "  ======================================================================" -ForegroundColor Green
