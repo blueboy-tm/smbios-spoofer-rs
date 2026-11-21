@@ -221,3 +221,42 @@ rustc --edition 2024 --test driver/src/attachment.rs -o attachment-tests
 ```
 
 [Windows interrupt time contract](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-kequeryinterrupttimeprecise)
+
+### PowerShell access and driver lifecycle review
+
+The debugger export remains the retrieval interface. The current driver only
+owns attached filter devices. Its common dispatch paths expect a filter
+extension and a lower device. A standalone control device would need its own
+dispatch routing for create, cleanup, close, device control and unsupported
+requests. It would also need a separate lifetime model. The existing completion
+counter covers selected storage requests, and the unload loop can stop waiting
+while that counter is still nonzero.
+
+A future control device should use a Windows-supported secure creation path
+such as IoCreateDeviceSecure, a dedicated class GUID, a protected DACL granting
+access to SYSTEM and Built-in Administrators, and FILE_DEVICE_SECURE_OPEN.
+That API uses the WDK Wdmsec library, outside the current import-only build.
+Its effective security descriptor and open behavior should be verified on
+Windows with SYSTEM, elevated administrators, filtered administrator tokens,
+and standard users, including opens with trailing path components. A
+PowerShell check can supplement those tests but cannot enforce the policy.
+
+A proposed protocol would allow one read-access METHOD_BUFFERED request,
+require zero input bytes, and return an explicit version and exactly 13
+serialized records. All other requests should fail with zero returned bytes.
+Initialization would need to publish the device only after it is ready and
+roll back both the symbolic link and the device on failure. Removing the link
+blocks opens through that link only. Existing handles and in-flight requests
+need a lifetime guarantee, including a Windows test that exercises unload with
+an open handle and concurrent reads. The storage completion counter cannot
+provide that guarantee for a standalone device.
+
+The available Linux cross-build environment cannot establish those runtime
+access and unload properties, and this review authorizes no driver install or
+restart. Use the WinDbg snapshot procedure above for the minimum hardware
+comparison. On a separately authorized, reviewed diagnostic build, boot once,
+capture the snapshot before unload and compare Get-PhysicalDisk with direct
+VPD 0x80 on the same boot. A successful attachment still leaves the provider's
+request path unresolved.
+
+[Windows device security API](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdmsec/) · [Device characteristics](https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/specifying-device-characteristics)
