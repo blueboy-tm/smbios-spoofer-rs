@@ -202,6 +202,10 @@ function Install-WindowsDiskFilterDriver {
     # Kernel driver services are reliably enumerated by Win32_SystemDriver;
     # Get-Service may omit device drivers on some Windows installations.
     $service = Get-CimInstance Win32_SystemDriver -Filter "Name = '$DriverServiceName'" -ErrorAction SilentlyContinue
+    $serviceKeyExists = Test-Path -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\$DriverServiceName"
+    if ($serviceKeyExists -and -not $service) {
+        throw "Service registration exists but its runtime state is unavailable; refusing unsafe installation. Check sc.exe query $DriverServiceName."
+    }
     if ($service) {
         & sc.exe config $DriverServiceName type= kernel start= system error= ignore binPath= $imagePath
         if ($LASTEXITCODE -ne 0) {
@@ -223,6 +227,10 @@ function Uninstall-WindowsDiskFilterDriver {
     # Kernel driver services are reliably enumerated by Win32_SystemDriver;
     # Get-Service may omit device drivers on some Windows installations.
     $service = Get-CimInstance Win32_SystemDriver -Filter "Name = '$DriverServiceName'" -ErrorAction SilentlyContinue
+    $serviceKeyExists = Test-Path -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\$DriverServiceName"
+    if ($serviceKeyExists -and -not $service) {
+        throw "Cannot determine state of registered $DriverServiceName; refusing to remove driver images."
+    }
     $wasRunning = $service -and $service.State -eq 'Running'
 
     if ($service) {
