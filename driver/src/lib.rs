@@ -14,15 +14,14 @@
 //!      (works even when the ESP has no drive letter mounted in Windows!).
 //! 3. **Automatic `DEVICEMAP\Scsi` Discovery & Registry Patch**:
 //!    - Scans `\Registry\Machine\HARDWARE\DEVICEMAP\Scsi\Scsi Port 0..3\Scsi Bus 0..5\Target Id 0..1\Logical Unit Id 0`
-//!      at `DriverEntry` (`PASSIVE_LEVEL`), captures the true factory disk serial into `ORIG_DISK_SERIAL`,
-//!      and overwrites `SerialNumber` in `DEVICEMAP\Scsi` via `ZwSetValueKey`.
+//!      at `DriverEntry` (`PASSIVE_LEVEL`) and overwrites `SerialNumber` in `DEVICEMAP\Scsi` via `ZwSetValueKey`.
 //! 4. **Multi-Stack Filter Attachment (`Harddisk0..7`, `RaidPort0..3`, `Spaceport`)**:
 //!    - Attaches Filter Device Objects (`FiDO`) to `\Device\Harddisk0\DR0`..`DR7`, `\Device\RaidPort0..3`,
 //!      and `\Device\Spaceport` (`Get-PhysicalDisk` / `MSFT_PhysicalDisk`).
 //!    - Intercepts `IRP_MJ_DEVICE_CONTROL` completion for `IOCTL_STORAGE_QUERY_PROPERTY` (including
-//!      `StorageDeviceProperty`, `StorageDeviceIdProperty`, `StorageDeviceUniqueIdProperty`),
+//!      `StorageDeviceProperty` and `StorageDeviceUniqueIdProperty`),
 //!      `IOCTL_STORAGE_PROTOCOL_COMMAND`, `SMART_RCV_DRIVE_DATA`, `IOCTL_ATA_PASS_THROUGH`,
-//!      `IOCTL_SCSI_PASS_THROUGH`, and `\Device\Spaceport` enumeration buffers.
+//!      and `IOCTL_SCSI_PASS_THROUGH`.
 
 #![no_std]
 #![no_main]
@@ -31,20 +30,17 @@
 use core::ffi::c_void;
 use core::panic::PanicInfo;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[path = "../../src/win_disk_patch.rs"]
 pub mod win_disk_patch;
 
-// ─── Global Spoofed & Original Disk Serial State ───────────────────────────
+// ─── Global Spoofed Disk Serial State ───────────────────────────
 
 // A missing/invalid v9 profile must not silently use a fixed fake serial.
 static mut SPOOFED_DISK_SERIAL: [u8; 20] = [b' '; 20];
 static mut SPOOFED_UUID_BYTES: [u8; 16] = [0u8; 16];
 static HAS_SPOOFED_UUID: AtomicBool = AtomicBool::new(false);
-static mut ORIG_DISK_SERIAL: [u8; 20] = [b' '; 20];
-static HAS_ORIG_SERIAL: AtomicBool = AtomicBool::new(false);
-static SPOOFED_DISK_SEED: AtomicU64 = AtomicU64::new(0x534D_4249_2026_0009);
 
 const MAX_ATTACHED_FIDOS: usize = 16;
 static mut ATTACHED_FIDOS: [*mut DEVICE_OBJECT; MAX_ATTACHED_FIDOS] =
@@ -99,7 +95,6 @@ pub const MDL_SOURCE_IS_NONPAGED_POOL: i16 = 0x0004;
 pub const SPOOF_CONFIG_MAGIC: u32 = 0x534D_4249; // "SMBI"
 pub const SPOOF_CONFIG_V9_SIZE: usize = 1710;
 pub const SPOOF_CONFIG_DISK_SERIAL_OFFSET: usize = 1574; // [u16; 64] = 128 bytes
-pub const SPOOF_CONFIG_DISK_SEED_OFFSET: usize = 1702; // u32 = 4 bytes
 
 // ─── Binary-Verified x64 WDM Kernel Structures ─────────────────────────────
 
@@ -496,13 +491,6 @@ fn parse_v9_config_bytes(raw: &[u8]) -> bool {
         return false;
     }
 
-    let seed = u32::from_le_bytes([
-        raw[SPOOF_CONFIG_DISK_SEED_OFFSET],
-        raw[SPOOF_CONFIG_DISK_SEED_OFFSET + 1],
-        raw[SPOOF_CONFIG_DISK_SEED_OFFSET + 2],
-        raw[SPOOF_CONFIG_DISK_SEED_OFFSET + 3],
-    ]) as u64;
-
     unsafe {
         SPOOFED_DISK_SERIAL = serial_20;
         let mut uuid_16 = [0u8; 16];
@@ -512,10 +500,6 @@ fn parse_v9_config_bytes(raw: &[u8]) -> bool {
             HAS_SPOOFED_UUID.store(true, Ordering::Release);
         }
     }
-    SPOOFED_DISK_SEED.store(
-        if seed != 0 { seed } else { 0x534D_4249 },
-        Ordering::Relaxed,
-    );
     true
 }
 
@@ -618,8 +602,8 @@ unsafe fn load_spoof_config_from_uefi_or_esp() -> bool {
             }
             if read_status >= 0
                 && iosb.Information >= SPOOF_CONFIG_V9_SIZE
-                && (iosb.Information as usize) <= raw_buf.len()
-                && parse_v9_config_bytes(&raw_buf[..iosb.Information as usize])
+                && iosb.Information <= raw_buf.len()
+                && parse_v9_config_bytes(&raw_buf[..iosb.Information])
             {
                 return true;
             }
@@ -630,9 +614,7 @@ unsafe fn load_spoof_config_from_uefi_or_esp() -> bool {
 
 /// Scans `\Registry\Machine\HARDWARE\DEVICEMAP\Scsi\Scsi Port P\Scsi Bus B\Target Id T\Logical Unit Id 0`
 /// at `DriverEntry` (`PASSIVE_LEVEL`):
-/// 1. Reads the existing `SerialNumber` value (`REG_SZ`) to capture `ORIG_DISK_SERIAL` (so substring
-///    patching works on any NVMe/SATA SSD model automatically).
-/// 2. Overwrites `SerialNumber` in `DEVICEMAP\Scsi` with `SPOOFED_DISK_SERIAL` (preserving `_00000001.` if present).
+/// Updates the existing `SerialNumber` value (`REG_SZ`) while preserving any `_00000001.` suffix.
 unsafe fn sync_devicemap_scsi_registry() {
     // Template (92 chars):
     // `\Registry\Machine\HARDWARE\DEVICEMAP\Scsi\Scsi Port 0\Scsi Bus 0\Target Id 0\Logical Unit Id 0`
@@ -726,27 +708,13 @@ unsafe fn sync_devicemap_scsi_registry() {
                             }
                         }
 
-                        if actual_chars >= 6 {
-                            let spoof = unsafe { SPOOFED_DISK_SERIAL };
-                            // Capture `ORIG_DISK_SERIAL` if it differs from `SPOOFED_DISK_SERIAL`
-                            if !HAS_ORIG_SERIAL.load(Ordering::Relaxed) {
-                                let mut orig_20 = [b' '; 20];
-                                let copy_n = core::cmp::min(actual_chars, 20);
-                                orig_20[..copy_n].copy_from_slice(&ascii_tmp[..copy_n]);
-                                if orig_20 != spoof {
-                                    unsafe {
-                                        ORIG_DISK_SERIAL = orig_20;
-                                    }
-                                    HAS_ORIG_SERIAL.store(true, Ordering::Release);
-                                }
-                            }
-
-                            // Patch `ascii_tmp[..actual_chars]` in-place (preserving `_00000001.` suffix)
-                            win_disk_patch::patch_ascii_serial_slice(
+                        let spoof = unsafe { SPOOFED_DISK_SERIAL };
+                        if actual_chars >= 6
+                            && win_disk_patch::patch_ascii_serial_slice(
                                 &mut ascii_tmp[..actual_chars],
                                 &spoof,
-                            );
-
+                            )
+                        {
                             // Encode back to UTF-16LE and write via `ZwSetValueKey`
                             let mut new_utf16 = [0u16; 64];
                             for k in 0..actual_chars {
@@ -931,20 +899,11 @@ unsafe extern "system" fn on_ioctl_complete(
                         }
                     }
                 }
-                let seed = SPOOFED_DISK_SEED.load(Ordering::Relaxed);
-                let has_orig = HAS_ORIG_SERIAL.load(Ordering::Acquire);
-                let orig = ORIG_DISK_SERIAL;
-
                 // 1. Patch `SystemBuffer` (`METHOD_BUFFERED`)
                 let sys_buf = (*irp).SystemBuffer as *mut u8;
                 if !sys_buf.is_null() {
                     let slice = core::slice::from_raw_parts_mut(sys_buf, valid_len);
-                    let _ = win_disk_patch::patch_ioctl_output_by_tag(tag, slice, &serial, seed);
-                    if has_orig {
-                        let _ = win_disk_patch::patch_buffer_occurrences_ascii_and_utf16(
-                            slice, &orig, &serial,
-                        );
-                    }
+                    win_disk_patch::patch_ioctl_output_by_tag(tag, slice, &serial);
                 }
 
                 // 2. Patch `MdlAddress->MappedSystemVa` if mapped in NonPaged system space (`METHOD_OUT_DIRECT`)
@@ -958,13 +917,7 @@ unsafe extern "system" fn on_ioctl_complete(
                     let mdl_len = core::cmp::min(valid_len, (*mdl).ByteCount as usize);
                     let mdl_slice =
                         core::slice::from_raw_parts_mut((*mdl).MappedSystemVa as *mut u8, mdl_len);
-                    let _ =
-                        win_disk_patch::patch_ioctl_output_by_tag(tag, mdl_slice, &serial, seed);
-                    if has_orig {
-                        let _ = win_disk_patch::patch_buffer_occurrences_ascii_and_utf16(
-                            mdl_slice, &orig, &serial,
-                        );
-                    }
+                    win_disk_patch::patch_ioctl_output_by_tag(tag, mdl_slice, &serial);
                 }
             }
         }
