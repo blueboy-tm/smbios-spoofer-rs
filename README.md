@@ -160,6 +160,16 @@ flowchart TD
 
 ---
 
+## Windows driver cleanup and repeatable installation
+
+For a **clean reinstall that keeps the UEFI profile**, use the new
+[`cleanup-drivers` → reboot → `cleanup-drivers` → `install` workflow](docs/windows-driver-lifecycle.md).
+The installer uses an immutable, signed driver filename for each build, so it
+never overwrites the image of a running kernel driver. `install.bat` exposes
+matching menu actions. The default driver feature is `spaceport-serial-patch`,
+which is experimental and currently guarded for the observed Micron 2400 response.
+You can instead select `-DriverFeature attachment-diagnostics` or `none`.
+
 ## ⚡ Quick Start: 1-Click Automated Installation
 
 ### 1. Prerequisites
