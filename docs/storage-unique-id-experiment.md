@@ -73,3 +73,61 @@ To revert to the previously tested serial-only behavior:
 ```
 
 Then restart normally. Do not manually stop the loaded WDM filter.
+
+## Kernel debugger counters: why the new ID is not visible
+
+When built with `namespace-id-patch`, the driver now exports a fixed-layout
+`SmbiosNamespaceIdCounters` symbol, visible to a **kernel debugger with
+matching symbols**. It is read-only telemetry; no disk ID or output content
+is retained, and no new user-mode IOCTL/device access is added.
+
+The structure holds **18 consecutive 64-bit words** (144 bytes): first nine
+for PropertyId 2 (`id`), then nine for PropertyId 3 (`duid`). Each group:
+
+| Word offset | Field | Meaning |
+|---|---|---|
+| +0 | requests | Matching IRP reached our dispatch and had output capacity |
+| +1 | completions | Our completion routine ran |
+| +2 | successful | NTSTATUS nonnegative |
+| +3 | failed | NTSTATUS negative |
+| +4 | invalid_output | Successful response with zero/oversized length or null SystemBuffer |
+| +5 | patch_attempts | Valid-length completion processed |
+| +6 | patched | Actual **identifier bytes** changed (not merely DUID serial) |
+| +7 | rejected | No matching old identifier, malformed descriptor or unavailable buffer |
+| +8 | last_status | Last 32-bit NTSTATUS, zero-extended |
+
+**Example from a kernel debugger** (with symbol loading configured for this
+versioned driver; no command below writes to memory):
+
+```text
+x *!SmbiosNamespaceIdCounters
+dq <address-returned-by-x> L12
+```
+
+WinDbg's `L12` uses hexadecimal count syntax: `0x12 = 18` qwords.
+The exact module name may be the versioned `smbios-disk-filter-r....sys`
+image, so first find the symbol using the `x *!...` wildcard. If the
+symbol is unavailable, **do not guess a kernel address**. Match the PE/PDB
+symbols for the loaded image or use a debugger-supported module listing.
+Kernel debugging may require separate Windows debugging setup; ordinary
+administrator PowerShell alone cannot directly read these kernel statics.
+
+With the debugger attached, capture counters, trigger:
+
+```powershell
+cargo run --release --manifest-path tools/storage-query/Cargo.toml --target x86_64-pc-windows-msvc
+```
+
+Then capture counters again. Interpret **deltas**, not totals since boot:
+
+- `requests = 0`: direct query did not traverse the instrumented filter path.
+- `requests > 0`, `completions = 0`: completion not reached yet, or a path issue.
+- `failed > 0` or `invalid_output > 0`: lower-layer status/length/buffer issue.
+- `patch_attempts > 0`, `rejected > 0`: observed response did not pass exact guards,
+  or no patchable buffer was available.
+- `patched > 0` and direct tool still shows the old ID: another layer may be
+  overwriting it or a different path is read by the tool.
+
+**No inference about Get-Disk/Get-PhysicalDisk is justified by these counters
+alone.** Keep PR #18 unmerged until the Windows build and diagnostic readout
+have been checked.
