@@ -16,16 +16,16 @@ fn le32(buf: &[u8], pos: usize) -> Option<usize> {
 /// serial. Non-cryptographic domain-separated hashing: not suitable as a
 /// globally assigned IEEE identifier. Reproducible across restarts.
 fn replacement(serial: &[u8; 20]) -> Option<[u8; 36]> {
-    let mut seen = false;
+    let mut non_space = 0usize;
     let mut padding = false;
     for &ch in serial {
         match ch {
             b' ' => padding = true,
-            b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' if !padding => seen = true,
+            b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' if !padding => non_space += 1,
             _ => return None,
         }
     }
-    if !seen { return None; }
+    if non_space < 4 { return None; }
     let mut first: u64 = 0xcbf29ce484222325;
     let mut second: u64 = 0x84222325cbf29ce4;
     for &byte in b"smbios-spoofer-rs:namespace-alias:v1".iter().chain(serial.iter()) {
