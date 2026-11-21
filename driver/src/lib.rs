@@ -30,6 +30,8 @@
 mod attachment;
 #[cfg(feature = "attachment-diagnostics")]
 mod spaceport_candidate;
+#[cfg(feature = "spaceport-serial-patch")]
+mod spaceport_serial_patch;
 use attachment::Outcome;
 
 #[cfg(feature = "attachment-diagnostics")]
@@ -46,6 +48,11 @@ static SmbiosSpaceportIoctlSnapshot: attachment::SpaceportIoctlCounters =
 #[unsafe(no_mangle)]
 static SmbiosSpaceportCandidateSnapshot: spaceport_candidate::CandidateSnapshot =
     spaceport_candidate::CandidateSnapshot::empty();
+
+#[cfg(feature = "spaceport-serial-patch")]
+#[unsafe(no_mangle)]
+static SmbiosSpaceportSerialPatchSnapshot: spaceport_serial_patch::PatchSnapshot =
+    spaceport_serial_patch::PatchSnapshot::empty();
 
 const TAG_SPACEPORT_DIAGNOSTIC: u8 = 0xFE;
 
@@ -934,6 +941,21 @@ unsafe extern "system" fn on_ioctl_complete(
                 spaceport_candidate::Check::inspect(output)
             };
             SmbiosSpaceportCandidateSnapshot.record(result);
+
+            // Separate opt-in feature: rewrite only the exact observed old
+            // UTF-16 string in the completed buffered Spaceport reply.
+            #[cfg(feature = "spaceport-serial-patch")]
+            if status == STATUS_SUCCESS && info_len > 0 && info_len <= cap
+                && !(*irp).SystemBuffer.is_null()
+            {
+                let output = core::slice::from_raw_parts_mut(
+                    (*irp).SystemBuffer as *mut u8,
+                    info_len,
+                );
+                let replacement = SPOOFED_DISK_SERIAL;
+                let result = spaceport_serial_patch::rewrite(output, &replacement);
+                SmbiosSpaceportSerialPatchSnapshot.record(result);
+            }
         }
 
         if status >= 0 && info_len > 0 && tag != TAG_SPACEPORT_DIAGNOSTIC {
