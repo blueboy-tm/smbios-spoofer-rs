@@ -28,6 +28,8 @@
 #![allow(non_snake_case, non_camel_case_types, dead_code)]
 
 mod attachment;
+#[cfg(feature = "attachment-diagnostics")]
+mod spaceport_candidate;
 use attachment::Outcome;
 
 #[cfg(feature = "attachment-diagnostics")]
@@ -39,6 +41,11 @@ static SmbiosAttachmentSnapshot: [attachment::Record; 13] =
 #[unsafe(no_mangle)]
 static SmbiosSpaceportIoctlSnapshot: attachment::SpaceportIoctlCounters =
     attachment::SpaceportIoctlCounters::empty();
+
+#[cfg(feature = "attachment-diagnostics")]
+#[unsafe(no_mangle)]
+static SmbiosSpaceportCandidateSnapshot: spaceport_candidate::CandidateSnapshot =
+    spaceport_candidate::CandidateSnapshot::empty();
 
 const TAG_SPACEPORT_DIAGNOSTIC: u8 = 0xFE;
 
@@ -909,6 +916,24 @@ unsafe extern "system" fn on_ioctl_complete(
         #[cfg(feature = "attachment-diagnostics")]
         if tag == TAG_SPACEPORT_DIAGNOSTIC {
             SmbiosSpaceportIoctlSnapshot.on_completion(status, info_len);
+            // METHOD_BUFFERED: inspect only a successful, bounded SystemBuffer view.
+            // The context records the original caller-provided output capacity.
+            // No response bytes are changed, stored, or exposed to the debugger.
+            let cap = packed & 0xFFFF_FFFF;
+            let result = if status != STATUS_SUCCESS {
+                (spaceport_candidate::Check::Unsuccessful, 0, 0)
+            } else if info_len > cap || info_len == 0 {
+                (spaceport_candidate::Check::BadLength, 0, 0)
+            } else if (*irp).SystemBuffer.is_null() {
+                (spaceport_candidate::Check::NullBuffer, 0, 0)
+            } else {
+                let output = core::slice::from_raw_parts(
+                    (*irp).SystemBuffer as *const u8,
+                    info_len,
+                );
+                spaceport_candidate::Check::inspect(output)
+            };
+            SmbiosSpaceportCandidateSnapshot.record(result);
         }
 
         if status >= 0 && info_len > 0 && tag != TAG_SPACEPORT_DIAGNOSTIC {

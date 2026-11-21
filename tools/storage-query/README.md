@@ -414,3 +414,57 @@ unload implementation uses a bounded wait for outstanding completion callbacks;
 this diagnostic adds one possible callback path but does not fix unload rundown.
 Avoid unloading/reloading the diagnostic driver while requests are in flight.
 No serial or response bytes are logged or exported by this feature.
+
+
+### Read-only candidate string shape check (optional diagnostic build)
+
+A separate `SmbiosSpaceportCandidateSnapshot` is emitted when the
+`attachment-diagnostics` feature is enabled. On each completed Spaceport
+`0x00E70408` request, the driver checks the existing output only if
+`NTSTATUS == STATUS_SUCCESS`, the output capacity is nonzero, the completed
+length is nonzero and does not exceed capacity, and `SystemBuffer` is non-null.
+The IOCTL is METHOD_BUFFERED; this diagnostic never falls back to an MDL,
+modifies response memory, or generates its own request.
+
+The tested **unverified hypothesis** is a little-endian u32 byte offset at
+output byte `0xA3C`, relative to the output start, pointing forward to an
+even-aligned, NUL-terminated, well-formed UTF-16LE candidate of at most 256
+non-NUL code units within the completed output. The check does **not**
+compare the candidate text to a known serial and cannot establish semantic
+ownership or writable capacity. A structural pass alone is not proof of the
+Spaceport wire format.
+
+Read the diagnostic snapshot on a running matching build:
+
+```text
+x *!SmbiosSpaceportCandidateSnapshot
+dq <reported-address> L5
+```
+
+| QWORD | Meaning |
+| --- | --- |
+| 0 | Total checks (one per tagged completion) |
+| 1 | Structurally plausible candidates |
+| 2 | Last result code |
+| 3 | Last candidate offset in bytes (untrusted) |
+| 4 | Last non-NUL UTF-16 units scanned |
+
+Last result codes: `1` plausible shape; `2` unsuccessful/nonzero status;
+`3` zero or oversized completed length; `4` missing offset field;
+`5` invalid/unaligned/out-of-range offset; `6` no terminator in bounds;
+`7` malformed UTF-16; `8` null SystemBuffer. The recorded values may
+reflect another request by the time WinDbg reads them. No serial bytes or
+identity values are logged, and `UniqueId`/EUI are untouched.
+
+For standalone tests without attempting to execute the `no_std` kernel
+driver as a user-mode program:
+
+```powershell
+rustc --edition=2024 --test driver/src/spaceport_candidate.rs -o "$env:TEMP\spaceport_candidate_tests.exe"
+& "$env:TEMP\spaceport_candidate_tests.exe" --nocapture
+```
+
+Build via `cargo build --release --manifest-path driver/Cargo.toml
+--target x86_64-pc-windows-msvc --features attachment-diagnostics`.
+Deploy only after reviewing the impact of running another completion callback
+in the existing bounded unload/rundown implementation.
