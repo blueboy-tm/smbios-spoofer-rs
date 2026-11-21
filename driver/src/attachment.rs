@@ -48,10 +48,70 @@ impl Record {
     }
 }
 
+/// Debugger-readable counters for the *existing* Spaceport detailed-drive IOCTL.
+/// These counters never inspect an input or output buffer.
+#[cfg(any(feature = "attachment-diagnostics", test))]
+#[repr(C)]
+pub struct SpaceportIoctlCounters {
+    pub requests: core::sync::atomic::AtomicU64,
+    pub completions: core::sync::atomic::AtomicU64,
+    pub successful_completions: core::sync::atomic::AtomicU64,
+    pub last_status: core::sync::atomic::AtomicU64,
+    pub last_information: core::sync::atomic::AtomicU64,
+}
+
+#[cfg(any(feature = "attachment-diagnostics", test))]
+impl SpaceportIoctlCounters {
+    pub const fn empty() -> Self {
+        use core::sync::atomic::AtomicU64;
+        Self {
+            requests: AtomicU64::new(0),
+            completions: AtomicU64::new(0),
+            successful_completions: AtomicU64::new(0),
+            last_status: AtomicU64::new(0),
+            last_information: AtomicU64::new(0),
+        }
+    }
+
+    pub fn on_request(&self) {
+        self.requests.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn on_completion(&self, status: i32, information: usize) {
+        use core::sync::atomic::Ordering;
+        self.last_status.store(u64::from(status as u32), Ordering::Relaxed);
+        self.last_information.store(information as u64, Ordering::Relaxed);
+        if status >= 0 {
+            self.successful_completions.fetch_add(1, Ordering::Relaxed);
+        }
+        self.completions.fetch_add(1, Ordering::Release);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use core::sync::atomic::Ordering;
+
+    #[test]
+    fn spaceport_counters_have_fixed_debugger_layout() {
+        assert_eq!(core::mem::size_of::<SpaceportIoctlCounters>(), 40);
+        assert_eq!(core::mem::offset_of!(SpaceportIoctlCounters, requests), 0);
+        assert_eq!(core::mem::offset_of!(SpaceportIoctlCounters, completions), 8);
+        assert_eq!(core::mem::offset_of!(SpaceportIoctlCounters, successful_completions), 16);
+        assert_eq!(core::mem::offset_of!(SpaceportIoctlCounters, last_status), 24);
+        assert_eq!(core::mem::offset_of!(SpaceportIoctlCounters, last_information), 32);
+        let counters = SpaceportIoctlCounters::empty();
+        counters.on_request();
+        counters.on_request();
+        counters.on_completion(0, 0x1234);
+        counters.on_completion(-1073741823, 0);
+        assert_eq!(counters.requests.load(Ordering::Relaxed), 2);
+        assert_eq!(counters.completions.load(Ordering::Acquire), 2);
+        assert_eq!(counters.successful_completions.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.last_status.load(Ordering::Relaxed), 0xC0000001);
+        assert_eq!(counters.last_information.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn debugger_layout_and_stage_status_are_stable() {
