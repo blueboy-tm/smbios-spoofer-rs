@@ -248,9 +248,12 @@ function Uninstall-WindowsDiskFilterDriver {
             Write-Warn "Could not remove $path ($($_.Exception.Message)). Retry after reboot."
         }
     }
-    if ($wasRunning -or $remaining.Count -gt 0) {
+    if ($wasRunning) {
         Write-Warn "REBOOT REQUIRED. After reboot run .\install.ps1 -Mode cleanup-drivers again."
-    } else {
-        Write-Ok "Driver cleanup complete. UEFI profile, firmware boot entry and signing certificates were preserved."
+        return
     }
+    if ($remaining.Count -gt 0) {
+        throw "Cleanup incomplete: $($remaining.Count) driver file(s) could not be removed. Inspect the listed files."
+    }
+    Write-Ok "Driver cleanup complete. UEFI profile, firmware boot entry and signing certificates were preserved."
 }
