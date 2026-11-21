@@ -906,9 +906,10 @@ unsafe extern "system" fn on_ioctl_complete(
                     win_disk_patch::patch_ioctl_output_by_tag(tag, slice, &serial);
                 }
 
-                // 2. Patch `MdlAddress->MappedSystemVa` if mapped in NonPaged system space (`METHOD_OUT_DIRECT`)
+                // The buffered SCSI pass-through header and its offsets are relative only to SystemBuffer.
                 let mdl = (*irp).MdlAddress;
-                if !mdl.is_null()
+                if tag != win_disk_patch::TAG_SCSI_PASS_THROUGH
+                    && !mdl.is_null()
                     && ((*mdl).MdlFlags & (MDL_MAPPED_TO_SYSTEM_VA | MDL_SOURCE_IS_NONPAGED_POOL))
                         != 0
                     && !(*mdl).MappedSystemVa.is_null()

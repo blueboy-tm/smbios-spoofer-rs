@@ -1,23 +1,8 @@
 use std::mem::{offset_of, size_of};
 
-// Layout of the WDK SCSI_PASS_THROUGH header. Serialize into a zero-filled
-// buffer so padding, reserved fields and unused CDB bytes are also zero.
-#[repr(C)]
-struct ScsiPassThrough {
-    length: u16,
-    scsi_status: u8,
-    path_id: u8,
-    target_id: u8,
-    lun: u8,
-    cdb_length: u8,
-    sense_info_length: u8,
-    data_in: u8,
-    transfer_length: u32,
-    timeout: u32,
-    data_buffer_offset: usize,
-    sense_info_offset: u32,
-    cdb: [u8; 16],
-}
+#[path = "../../../src/scsi_pass_through.rs"]
+mod scsi_pass_through;
+use scsi_pass_through::ScsiPassThrough;
 
 pub const HEADER_SIZE: usize = size_of::<ScsiPassThrough>();
 const TRANSFER_LENGTH: usize = offset_of!(ScsiPassThrough, transfer_length);

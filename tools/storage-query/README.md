@@ -59,6 +59,31 @@ call with WMI activity and available storage I/O traces. This is also the
 read-only alternative when pass-through is unavailable. See the trace plan in
 the [handoff](../../handoff.md).
 
+### Interpreting a page `0x80` result with the filter
+
+On the tested Micron 2400, the direct page `0x80` reply matched the grouped
+`MSFT_PhysicalDisk.SerialNumber` exactly. The direct storage-property serial,
+DUID embedded serial, `Win32_DiskDrive`, and `MSFT_Disk` instead matched the
+configured serial. The VPD `0x83` identifier remained valid. Matching strings
+still leave the provider's device stack, IOCTL choice, and cache behavior open.
+
+The x64 filter recognizes only buffered, data-in EVPD `0x80` INQUIRY replies
+whose request, completion status, transfer length, and page bounds validate.
+It can replace an ASCII unit-serial field such as the grouped Micron string.
+VPD `0x83`, EUI-64 and NGUID identifier fields, `eui.` strings, and unrelated
+SCSI requests pass through unchanged. The filter does not decode WOW64
+pass-through headers on its x64 path.
+
+Before comparing behavior on hardware, retain the unmodified baseline results
+from the direct queries and provider objects. For any subsequent hardware
+test, confirm the buffered completion crosses the intended filter and record
+the NTSTATUS, `IoStatus.Information`, output capacity, data offset, and transfer
+length. The filter uses only the smaller of the byte count and capacity. A
+header-only or incomplete completion therefore keeps the original payload. A
+changed direct page `0x80` serial can coexist with an unchanged provider value.
+Compare page `0x83` and the namespace identifiers byte-for-byte against the
+baseline as well.
+
 ## Compare the same disk across APIs
 
 ```powershell
