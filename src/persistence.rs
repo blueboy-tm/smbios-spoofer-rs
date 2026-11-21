@@ -405,7 +405,9 @@ impl SpoofConfig {
 
         let orig_disk_len = utils::str_len(&orig.first_disk_serial).min(20);
         let curr_disk = self.disk_serial;
-        if orig_disk_len > 0 && utils::str_len(&curr_disk) != orig_disk_len {
+        let original_valid = utils::is_plausible_disk_serial(&orig.first_disk_serial);
+        let current_valid = utils::is_plausible_disk_serial(&curr_disk);
+        if !current_valid || (original_valid && utils::str_len(&curr_disk) != orig_disk_len) {
             let seed = if self.disk_serial_seed == 0 {
                 let s = utils::random_u32() | 1;
                 self.disk_serial_seed = s;
@@ -694,6 +696,21 @@ pub fn save_config(config: &SpoofConfig) -> PersistenceStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn corrupted_v9_serial_is_repaired() {
+        let mut cfg = SpoofConfig::default();
+        cfg.generate();
+        let mut broken = [0u16; 64];
+        broken[0] = b';' as u16;
+        broken[1] = b';' as u16;
+        cfg.disk_serial = broken;
+        let originals = OriginalSmbiosData::default();
+        assert!(cfg.repair_with_originals(&originals));
+        let serial = cfg.disk_serial;
+        assert!(utils::is_plausible_disk_serial(&serial));
+        assert!(cfg.is_valid());
+    }
 
     #[test]
     fn test_spoof_config_generate_and_checksum() {
