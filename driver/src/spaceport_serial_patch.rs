@@ -156,7 +156,7 @@ mod tests {
     fn rejects_short_and_bad_profile_without_write() {
         let mut output = fixture();
         let original = output.clone();
-        assert_eq!(rewrite(&mut output[..0xDA0], b"D1F9V96CQUN4DJ7X    "), Rewrite::BadResponse);
+        assert_eq!(rewrite(&mut output[..EXPECTED_OFFSET + (OLD_UNITS + 1) * 2 - 1], b"D1F9V96CQUN4DJ7X    "), Rewrite::BadResponse);
         assert_eq!(output, original);
         assert_eq!(rewrite(&mut output, &[b' '; 20]), Rewrite::InvalidReplacement);
         assert_eq!(output, original);
