@@ -178,3 +178,38 @@ mod tests {
         assert!(!rewrite_device_id(&mut out, &serial));
     }
 }
+
+#[cfg(test)]
+mod diagnostic_rejection_tests {
+    use super::*;
+
+    #[test]
+    fn truncated_or_unrecognized_id_responses_preserve_every_byte() {
+        let serial = *b"ZNGR2179MCBYD1M     ";
+        let mut descriptor = [0_u8; 64];
+        descriptor[0..4].copy_from_slice(&12_u32.to_le_bytes());
+        descriptor[4..8].copy_from_slice(&64_u32.to_le_bytes());
+        descriptor[8..12].copy_from_slice(&1_u32.to_le_bytes());
+        descriptor[12..16].copy_from_slice(&3_u32.to_le_bytes());
+        descriptor[16..20].copy_from_slice(&8_u32.to_le_bytes());
+        descriptor[20..22].copy_from_slice(&36_u16.to_le_bytes());
+        descriptor[28..].copy_from_slice(OLD_ID);
+        for length in 0..descriptor.len() {
+            let mut input = descriptor[..length].to_vec();
+            let before = input.clone();
+            assert!(!rewrite_device_id(&mut input, &serial));
+            assert_eq!(input, before, "prefix length {length}");
+        }
+        for (offset, value) in [(4, u32::MAX), (8, 2), (12, 1), (16, 3), (24, 1)] {
+            let mut input = descriptor;
+            input[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            let before = input;
+            assert!(!rewrite_device_id(&mut input, &serial));
+            assert_eq!(input, before, "field offset {offset}");
+        }
+        descriptor[63] ^= 1;
+        let before = descriptor;
+        assert!(!rewrite_device_id(&mut descriptor, &serial));
+        assert_eq!(descriptor, before);
+    }
+}
