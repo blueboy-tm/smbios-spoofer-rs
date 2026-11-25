@@ -28,6 +28,8 @@
 #![allow(non_snake_case, non_camel_case_types, dead_code)]
 
 mod attachment;
+#[cfg(feature = "namespace-id-patch")]
+mod namespace_id_diagnostics;
 #[cfg(feature = "attachment-diagnostics")]
 mod spaceport_candidate;
 #[cfg(feature = "spaceport-serial-patch")]
@@ -53,6 +55,12 @@ static SmbiosSpaceportCandidateSnapshot: spaceport_candidate::CandidateSnapshot 
 #[unsafe(no_mangle)]
 static SmbiosSpaceportSerialPatchSnapshot: spaceport_serial_patch::PatchSnapshot =
     spaceport_serial_patch::PatchSnapshot::empty();
+
+#[cfg(feature = "namespace-id-patch")]
+#[allow(non_upper_case_globals)] // Keep the symbol discoverable in kernel debuggers.
+#[unsafe(no_mangle)]
+pub static SmbiosNamespaceIdCounters: namespace_id_diagnostics::NamespaceIdCounters =
+    namespace_id_diagnostics::NamespaceIdCounters::empty();
 
 const TAG_SPACEPORT_DIAGNOSTIC: u8 = 0xFE;
 
@@ -919,6 +927,24 @@ unsafe extern "system" fn on_ioctl_complete(
         let info_len = (*irp).IoStatus.Information;
         let packed = context as usize;
         let tag = ((packed >> 32) & 0xFF) as u8;
+        #[cfg(feature = "namespace-id-patch")]
+        let id_counters = SmbiosNamespaceIdCounters.for_tag(tag);
+        #[cfg(feature = "namespace-id-patch")]
+        let namespace_request = id_counters.is_some();
+        #[cfg(not(feature = "namespace-id-patch"))]
+        let namespace_request = false;
+        #[cfg(feature = "namespace-id-patch")]
+        if let Some(counters) = id_counters {
+            let cap = packed & 0xFFFF_FFFF;
+            let valid = namespace_id_diagnostics::valid_buffered_output(
+                status, info_len, cap, !(*irp).SystemBuffer.is_null(),
+            );
+            counters.on_completion(status, valid);
+            if !valid {
+                ACTIVE_IRPS.fetch_sub(1, Ordering::AcqRel);
+                return STATUS_SUCCESS;
+            }
+        }
 
         #[cfg(feature = "attachment-diagnostics")]
         if tag == TAG_SPACEPORT_DIAGNOSTIC {
@@ -964,6 +990,8 @@ unsafe extern "system" fn on_ioctl_complete(
 
             let valid_len = core::cmp::min(info_len, out_buf_cap);
             if valid_len > 0 && tag != win_disk_patch::TAG_NONE {
+                #[cfg(feature = "namespace-id-patch")]
+                let mut namespace_changed = false;
                 let mut serial = SPOOFED_DISK_SERIAL;
                 if disk_idx > 0 && disk_idx < 8 {
                     for slot in serial.iter_mut().rev() {
@@ -982,12 +1010,20 @@ unsafe extern "system" fn on_ioctl_complete(
                 let sys_buf = (*irp).SystemBuffer as *mut u8;
                 if !sys_buf.is_null() {
                     let slice = core::slice::from_raw_parts_mut(sys_buf, valid_len);
+                    #[cfg(feature = "namespace-id-patch")]
+                    {
+                        let changed =
+                            win_disk_patch::patch_ioctl_output_with_namespace_id(tag, slice, &serial);
+                        namespace_changed |= changed;
+                    }
+                    #[cfg(not(feature = "namespace-id-patch"))]
                     win_disk_patch::patch_ioctl_output_by_tag(tag, slice, &serial);
                 }
 
                 // The buffered SCSI pass-through header and its offsets are relative only to SystemBuffer.
                 let mdl = (*irp).MdlAddress;
-                if tag != win_disk_patch::TAG_SCSI_PASS_THROUGH
+                if !namespace_request
+                    && tag != win_disk_patch::TAG_SCSI_PASS_THROUGH
                     && !mdl.is_null()
                     && ((*mdl).MdlFlags & (MDL_MAPPED_TO_SYSTEM_VA | MDL_SOURCE_IS_NONPAGED_POOL))
                         != 0
@@ -997,7 +1033,18 @@ unsafe extern "system" fn on_ioctl_complete(
                     let mdl_len = core::cmp::min(valid_len, (*mdl).ByteCount as usize);
                     let mdl_slice =
                         core::slice::from_raw_parts_mut((*mdl).MappedSystemVa as *mut u8, mdl_len);
+                    #[cfg(feature = "namespace-id-patch")]
+                    {
+                        let changed =
+                            win_disk_patch::patch_ioctl_output_with_namespace_id(tag, mdl_slice, &serial);
+                        namespace_changed |= changed;
+                    }
+                    #[cfg(not(feature = "namespace-id-patch"))]
                     win_disk_patch::patch_ioctl_output_by_tag(tag, mdl_slice, &serial);
+                }
+                #[cfg(feature = "namespace-id-patch")]
+                if let Some(counters) = id_counters {
+                    counters.on_patch(namespace_changed);
                 }
             }
         }
@@ -1047,6 +1094,10 @@ unsafe extern "system" fn dispatch_device_control(
                 tag
             };
             if tag != win_disk_patch::TAG_NONE && out_len > 0 {
+                #[cfg(feature = "namespace-id-patch")]
+                if let Some(counters) = SmbiosNamespaceIdCounters.for_tag(tag) {
+                    counters.on_request();
+                }
                 #[cfg(feature = "attachment-diagnostics")]
                 if tag == TAG_SPACEPORT_DIAGNOSTIC {
                     SmbiosSpaceportIoctlSnapshot.on_request();
