@@ -38,8 +38,8 @@ On an authorized Windows test machine, save the pre-change output, review
 the test module, and build using the existing installer:
 
 ```powershell
-git switch main
-git pull --ff-only origin main
+git fetch origin feat/guarded-storage-unique-id-patch
+git switch --detach FETCH_HEAD
 .\install.ps1 -Mode build-only -DriverFeature "spaceport-serial-patch,namespace-id-patch"
 .\install.ps1 -Mode install-driver -DriverFeature "spaceport-serial-patch,namespace-id-patch"
 ```
@@ -131,3 +131,19 @@ Then capture counters again. Interpret **deltas**, not totals since boot:
 **No inference about Get-Disk/Get-PhysicalDisk is justified by these counters
 alone.** Keep PR #18 unmerged until the Windows build and diagnostic readout
 have been checked.
+
+## Reported Windows results for 277fa62
+
+The configured image was signed and the service was running. The report
+does not identify the loaded build or confirm its feature flags. The profile
+and observed serial after the run agreed. Both Get-Disk and the status
+report's PhysicalDisk row still showed the original EUI string. The two
+direct IOCTL values were not collected in that post-run report.
+
+On the same boot, collect the direct queries with the storage-query command
+above and read both Get-Disk and Get-PhysicalDisk. Correlate disk number,
+physical location and size independently of the reported serial and UID.
+When available, record the loaded module and counter deltas around the
+direct query. If both direct IDs change while PhysicalDisk does not, evidence
+of the field actually consumed by MISpace is required before any further
+handler. No Spaceport UID layout has been established.

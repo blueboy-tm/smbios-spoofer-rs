@@ -930,15 +930,20 @@ unsafe extern "system" fn on_ioctl_complete(
         #[cfg(feature = "namespace-id-patch")]
         let id_counters = SmbiosNamespaceIdCounters.for_tag(tag);
         #[cfg(feature = "namespace-id-patch")]
+        let namespace_request = id_counters.is_some();
+        #[cfg(not(feature = "namespace-id-patch"))]
+        let namespace_request = false;
+        #[cfg(feature = "namespace-id-patch")]
         if let Some(counters) = id_counters {
             let cap = packed & 0xFFFF_FFFF;
-            counters.on_completion(
-                status,
-                status >= 0
-                    && info_len > 0
-                    && info_len <= cap
-                    && !(*irp).SystemBuffer.is_null(),
+            let valid = namespace_id_diagnostics::valid_buffered_output(
+                status, info_len, cap, !(*irp).SystemBuffer.is_null(),
             );
+            counters.on_completion(status, valid);
+            if !valid {
+                ACTIVE_IRPS.fetch_sub(1, Ordering::AcqRel);
+                return STATUS_SUCCESS;
+            }
         }
 
         #[cfg(feature = "attachment-diagnostics")]
@@ -1017,7 +1022,8 @@ unsafe extern "system" fn on_ioctl_complete(
 
                 // The buffered SCSI pass-through header and its offsets are relative only to SystemBuffer.
                 let mdl = (*irp).MdlAddress;
-                if tag != win_disk_patch::TAG_SCSI_PASS_THROUGH
+                if !namespace_request
+                    && tag != win_disk_patch::TAG_SCSI_PASS_THROUGH
                     && !mdl.is_null()
                     && ((*mdl).MdlFlags & (MDL_MAPPED_TO_SYSTEM_VA | MDL_SOURCE_IS_NONPAGED_POOL))
                         != 0

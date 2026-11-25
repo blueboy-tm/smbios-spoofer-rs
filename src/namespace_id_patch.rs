@@ -64,7 +64,7 @@ pub fn rewrite_device_id(response: &mut [u8], serial: &[u8; 20]) -> bool {
     let Some(id) = response.get_mut(start..start + OLD_ID.len()) else {
         return false;
     };
-    if &*id != OLD_ID.as_slice() { return false; }
+    if &*id != OLD_ID.as_slice() || &*id == new_id.as_slice() { return false; }
     id.copy_from_slice(&new_id);
     true
 }

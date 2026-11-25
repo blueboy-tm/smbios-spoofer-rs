@@ -6,6 +6,10 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub const TAG_ID: u8 = 10;
 pub const TAG_DUID: u8 = 9;
 
+pub fn valid_buffered_output(status: i32, completed: usize, capacity: usize, has_buffer: bool) -> bool {
+    status == 0 && completed > 0 && completed <= capacity && has_buffer
+}
+
 /// Exactly nine little-endian u64 fields per property. Stable layout for 'dq'.
 #[repr(C)]
 pub struct PropertyCounters {
@@ -42,7 +46,7 @@ impl PropertyCounters {
         }
         self.completions.fetch_add(1, Ordering::Release);
     }
-    /// One logical attempt per completion, regardless of SystemBuffer/MDL.
+    /// One logical attempt per validated SystemBuffer completion.
     pub fn on_patch(&self, changed: bool) {
         if changed { self.patched.fetch_add(1, Ordering::Relaxed); }
         else { self.rejected.fetch_add(1, Ordering::Relaxed); }
@@ -71,6 +75,16 @@ impl NamespaceIdCounters {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn namespace_output_requires_complete_success_and_system_buffer() {
+        assert!(valid_buffered_output(0, 64, 64, true));
+        assert!(!valid_buffered_output(0, 64, 64, false));
+        assert!(!valid_buffered_output(0, 65, 64, true));
+        assert!(!valid_buffered_output(0, 0, 64, true));
+        assert!(!valid_buffered_output(-1, 64, 64, true));
+        assert!(!valid_buffered_output(1, 64, 64, true));
+    }
+
     #[test]
     fn layout_is_stable_for_kernel_debugger() {
         assert_eq!(core::mem::size_of::<PropertyCounters>(), 72);
